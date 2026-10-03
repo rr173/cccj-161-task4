@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventStore } from '../src/store.js';
 import { NotifierEngine, NOTIFY_TYPES, ITEM_STATUS } from '../notifier/engine.js';
+import { OrchestratorTailer } from '../notifier/tailer.js';
 import { hmacHex } from '../notifier/crypto.js';
 import { canonicalJSON } from '../src/util.js';
 
@@ -45,13 +46,16 @@ let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ntf-')); });
 test.afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-test('五类通知都能生成不可变信封并按主题入队', async () => {
+test('八类通知都能生成不可变信封并按主题入队', async () => {
   const { eng, load } = freshEngine(join(dir, 'n.log'));
   await load();
   const c1 = eng.createSubscriber({ subscriberId: 'all', callbackUrl: 'http://127.0.0.1:9/x/callback' });
   eng.validationResolved('all', true, 'ok', 200);
   const c2 = eng.createSubscriber({ subscriberId: 'only-pub', callbackUrl: 'http://127.0.0.1:9/y/callback', topics: ['dr.event.published'] });
   eng.validationResolved('only-pub', true, 'ok', 200);
+  // 只订阅异议主题（前缀通配 dr.objection.*）
+  const c3 = eng.createSubscriber({ subscriberId: 'only-obj', callbackUrl: 'http://127.0.0.1:9/w/callback', topics: ['dr.objection.*'] });
+  eng.validationResolved('only-obj', true, 'ok', 200);
   // 待校验的订阅方不收通知
   eng.createSubscriber({ subscriberId: 'pending', callbackUrl: 'http://127.0.0.1:9/z/callback' });
 
@@ -61,10 +65,13 @@ test('五类通知都能生成不可变信封并按主题入队', async () => {
     assert.equal(r.deduplicated, false);
     assert.equal(r.envelopeSeq, seq);
   }
-  assert.equal(eng.subscriberView('all').queue.length, 5);
+  assert.equal(eng.subscriberView('all').queue.length, 8);
   const onlyPub = eng.subscriberView('only-pub').queue;
   assert.equal(onlyPub.length, 1);
   assert.equal(onlyPub[0].envelopeSeq, 1);
+  // 异议三类（#6/#7/#8）进入 dr.objection.* 订阅方，事件类不进入
+  const onlyObj = eng.subscriberView('only-obj').queue;
+  assert.deepEqual(onlyObj.map((q) => q.envelopeSeq), [6, 7, 8]);
   assert.equal(eng.subscriberView('pending').queue.length, 0);
 
   // 信封不可变：账本记录里的信封与签名证据锚定
@@ -73,6 +80,8 @@ test('五类通知都能生成不可变信封并按主题入队', async () => {
   assert.equal(v.signatureValid, true);
   assert.equal(v.chainOk, true);
   assert.equal(v.ledgerHash, rec.hash);
+  // 异议信封同样可独立验签
+  assert.equal(eng.verifyEnvelope(6).signatureValid, true);
 });
 
 test('sourceRef 幂等：重复接入不生成新信封、不重复入队', async () => {
@@ -332,4 +341,55 @@ test('不同订阅方互不影响：一方死信阻塞，另一方持续推进',
   for (let seq = 1; seq <= 3; seq++) await driveToAck(eng, 'b', b.secret, seq);
   assert.equal(eng.subscriberView('b').cursor, 3);
   assert.equal(eng.subscriberView('a').cursor, 0);
+});
+
+test('编排日志桥接：异议受理/补充/结论映射为三类签名消息且 orch:seq 去重', async () => {
+  const { eng, load } = freshEngine(join(dir, 'bridge.log'));
+  await load();
+  eng.createSubscriber({ subscriberId: 's', callbackUrl: 'http://127.0.0.1:9/cb', topics: ['*'] });
+  eng.validationResolved('s', true, 'ok', 200);
+
+  const orchFile = join(dir, 'events.log');
+  const orch = new EventStore(orchFile);
+  const tailer = new OrchestratorTailer({ engine: eng }, orchFile, { pollMs: 999999 });
+
+  orch.append('OBJECTION_FILED', {
+    id: 'OBJ_1', eventId: 'EV-9', reportVersion: 1, reportId: 'EV-9:v1',
+    reportHash: 'a'.repeat(64), aggregatorId: 'AGG-A', verdict: 'MISSED',
+    deadlineMs: 42, reason: 'x',
+  });
+  orch.append('OBJECTION_MATERIAL_APPENDED', {
+    objectionId: 'OBJ_1', eventId: 'EV-9', reportVersion: 1, seq: 1, summary: '证书',
+  });
+  orch.append('OBJECTION_REVIEWED', {
+    objectionId: 'OBJ_1', eventId: 'EV-9', reportVersion: 1, target: 'EV-9:v1',
+    decision: 'APPROVED',
+  });
+  await tailer.pump();
+
+  const types = eng.store.all()
+    .filter((r) => r.type === 'DR_NOTIFICATION')
+    .map((r) => r.payload.envelope.type);
+  assert.deepEqual(types, [
+    'dr.objection.filed',
+    'dr.objection.supplemented',
+    'dr.objection.decided',
+  ]);
+
+  // 三封均带有效签名，且各信封 detail 含异议编号/标的/结论
+  const recs = eng.store.all().filter((r) => r.type === 'DR_NOTIFICATION');
+  assert.equal(recs[0].payload.envelope.detail.target, 'EV-9:v1');
+  assert.equal(recs[1].payload.envelope.detail.materialSeq, 1);
+  assert.equal(recs[2].payload.envelope.detail.decision, 'APPROVED');
+  for (const [i] of recs.entries()) {
+    assert.equal(eng.verifyEnvelope(i + 1).signatureValid, true);
+  }
+  // 订阅方收到全部三封
+  assert.equal(eng.subscriberView('s').queue.length, 3);
+
+  // 幂等：尾随位置丢失后从头重读，同一 orch:seq 不重复入队
+  tailer.offset = 0;
+  await tailer.pump();
+  assert.equal(eng.subscriberView('s').queue.length, 3);
+  assert.equal(eng.envelopeSeq, 3);
 });

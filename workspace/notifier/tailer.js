@@ -9,6 +9,9 @@ const MAP = {
   EVENT_CANCELLED: 'dr.event.cancelled',
   EVENT_ACTIVATED: 'dr.event.started',
   EVENT_CLOSED: 'dr.event.ended',
+  OBJECTION_FILED: 'dr.objection.filed',
+  OBJECTION_MATERIAL_APPENDED: 'dr.objection.supplemented',
+  OBJECTION_REVIEWED: 'dr.objection.decided',
 };
 
 export class OrchestratorTailer {
@@ -92,6 +95,48 @@ export class OrchestratorTailer {
 
   #mapRecord(rec) {
     const p = rec.payload;
+    // 履约异议三类：载荷结构不同于事件，先于通用 MAP 映射，detail 携带标的编号/指纹/结论。
+    if (rec.type === 'OBJECTION_FILED') {
+      return {
+        type: 'dr.objection.filed',
+        eventId: p.eventId,
+        detail: {
+          orchestratorSeq: rec.seq,
+          objectionId: p.id,
+          target: `${p.eventId}:v${p.reportVersion}`,
+          reportId: p.reportId,
+          reportVersion: p.reportVersion,
+          reportHash: p.reportHash,
+          aggregatorId: p.aggregatorId,
+          verdict: p.verdict,
+          deadlineMs: p.deadlineMs,
+        },
+      };
+    }
+    if (rec.type === 'OBJECTION_MATERIAL_APPENDED') {
+      return {
+        type: 'dr.objection.supplemented',
+        eventId: p.eventId,
+        detail: {
+          orchestratorSeq: rec.seq,
+          objectionId: p.objectionId,
+          materialSeq: p.seq,
+        },
+      };
+    }
+    if (rec.type === 'OBJECTION_REVIEWED') {
+      return {
+        type: 'dr.objection.decided',
+        eventId: p.eventId,
+        detail: {
+          orchestratorSeq: rec.seq,
+          objectionId: p.objectionId,
+          target: p.target,
+          reportVersion: p.reportVersion,
+          decision: p.decision,
+        },
+      };
+    }
     if (MAP[rec.type]) {
       // 编排方对“开始后撤销”会补一条 reason=CANCEL_AFTER_START 的内部一致性记录
       // （状态在 激活→撤销 间归位），对订阅方是同一次撤销，不重复通知。

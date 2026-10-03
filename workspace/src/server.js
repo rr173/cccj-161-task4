@@ -173,6 +173,57 @@ const server = createServer(async (req, res) => {
         offline: !!body.offline,
       }));
     }
+
+    // ---- 履约异议处置 ----
+    if (path === '/api/objections' && req.method === 'GET') {
+      const agg = url.searchParams.get('aggregatorId');
+      const status = url.searchParams.get('status');
+      const target = url.searchParams.get('target');
+      let list = kernel.objectionListView();
+      if (agg) list = list.filter((o) => o.aggregatorId === agg);
+      if (status) list = list.filter((o) => o.status === status);
+      if (target) list = list.filter((o) => o.target === target);
+      return send(res, 200, { count: list.length, objections: list });
+    }
+    if (path === '/api/objections' && req.method === 'POST') {
+      const out = kernel.dispatch({
+        type: 'FILE_OBJECTION',
+        requestId: body.requestId ?? req.headers['x-request-id'],
+        eventId: body.eventId,
+        reportVersion: body.reportVersion,
+        reportHash: body.reportHash,
+        aggregatorId: body.aggregatorId,
+        reason: body.reason,
+      });
+      return send(res, out.idempotent ? 200 : 201, out);
+    }
+    const objMatch = path.match(/^\/api\/objections\/([^/]+)$/);
+    if (objMatch && req.method === 'GET') {
+      const obj = kernel.objectionView(decodeURIComponent(objMatch[1]));
+      if (!obj) return send(res, 404, { error: '异议不存在' });
+      return send(res, 200, obj);
+    }
+    const objMaterials = path.match(/^\/api\/objections\/([^/]+)\/materials$/);
+    if (objMaterials && req.method === 'POST') {
+      return send(res, 200, kernel.dispatch({
+        type: 'APPEND_OBJECTION_MATERIAL',
+        requestId: body.requestId ?? req.headers['x-request-id'],
+        objectionId: decodeURIComponent(objMaterials[1]),
+        aggregatorId: body.aggregatorId,
+        summary: body.summary,
+        content: body.content,
+      }));
+    }
+    const objReview = path.match(/^\/api\/objections\/([^/]+)\/review$/);
+    if (objReview && req.method === 'POST') {
+      return send(res, 200, kernel.dispatch({
+        type: 'REVIEW_OBJECTION',
+        objectionId: decodeURIComponent(objReview[1]),
+        decision: body.decision,
+        rationale: body.rationale,
+        reviewerId: body.reviewerId,
+      }));
+    }
     if (path === '/api/sim/tick' && req.method === 'POST') {
       return send(res, 200, kernel.dispatch({ type: 'TICK', minutes: Number(body.minutes ?? 15) }));
     }
@@ -219,6 +270,10 @@ const server = createServer(async (req, res) => {
       DEVICE_BUSY: 409, DEVICE_ALREADY_CLAIMED: 409, METER_MISMATCH: 409,
       EVENT_TERMINAL: 409, EVENT_RECALLED: 409, NOT_CLAIMED: 409,
       PHASE_CONFLICT: 409, STALE_SEQ: 409, DAY_PRESENT: 409,
+      FINGERPRINT_MISMATCH: 409, IDEMPOTENCY_CONFLICT: 409,
+      DUPLICATE_PENDING_OBJECTION: 409, OBJECTION_DEADLINE_PASSED: 409,
+      OBJECTION_ALREADY_DECIDED: 409, NOT_OBJECTION_OWNER: 403,
+      REPORT_NOT_SEALED: 409,
       LOG_QUARANTINED: 503,
       UNKNOWN_COMMAND: 400,
     };

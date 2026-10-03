@@ -15,6 +15,8 @@ import {
   iso,
   round3,
   uid,
+  sha256Hex,
+  canonicalJSON,
 } from './util.js';
 
 export class DomainError extends Error {
@@ -27,6 +29,13 @@ export class DomainError extends Error {
 
 const RECEIPT_STATUSES = ['ACCEPTED', 'DECLINED', 'EXECUTING', 'RECOVERED'];
 const EVENT_TERMINAL = new Set(['RECALLED', 'CLOSED']);
+
+// 履约异议处置：自裁定封存（报告签发）时刻起的受理时限。
+// 时限锚定在只增记录里（deadlineMs 随 OBJECTION_FILED 落盘），重启后不变化。
+export const OBJECTION_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const OBJECTION_STATUS = Object.freeze({ PENDING: 'PENDING', APPROVED: 'APPROVED', REJECTED: 'REJECTED' });
+const REVIEW_DECISIONS = ['APPROVED', 'REJECTED'];
+const HASH64_RE = /^[0-9a-f]{64}$/;
 
 // 事件窗口内真实出力（仿真）：基线画像减去执行设备的削减量
 function simIntervalActual(meterIdx, ts, totalShedKw) {
@@ -82,6 +91,10 @@ export class Kernel {
       inbox: new Set(), // deviceId:receiptId
       baselines: new Map(), // eventId -> [versions]
       reports: new Map(), // eventId -> [reports]
+      objections: new Map(), // objectionId -> 异议聚合（只增投影）
+      objectionIds: [], // 受理顺序
+      objectionsByEvent: new Map(), // eventId -> Set(objectionId)
+      objectionRequests: new Map(), // 客户请求号 -> 原请求摘要（受理/补充的幂等与 409）
       sheds: new Map(), // deviceId -> Map(ts -> kw)
       offline: new Set(),
       genCursor: floorInterval(BASE_NOW),
@@ -246,6 +259,61 @@ export class Kernel {
       case 'REPORT_ISSUED':
         s.reports.get(p.report.eventId)?.push(p.report);
         break;
+      case 'OBJECTION_FILED': {
+        s.objections.set(p.id, {
+          id: p.id,
+          eventId: p.eventId,
+          reportVersion: p.reportVersion,
+          reportId: p.reportId,
+          reportHash: p.reportHash, // 被质疑标的内容指纹（封存后永不改写）
+          aggregatorId: p.aggregatorId,
+          reason: p.reason,
+          status: 'PENDING',
+          filedAt: p.at,
+          deadlineMs: p.deadlineMs,
+          materials: [],
+          review: null,
+        });
+        s.objectionIds.push(p.id);
+        if (!s.objectionsByEvent.has(p.eventId)) s.objectionsByEvent.set(p.eventId, new Set());
+        s.objectionsByEvent.get(p.eventId).add(p.id);
+        s.objectionRequests.set(p.requestId, {
+          kind: 'FILE',
+          bodyHash: p.bodyHash,
+          objectionId: p.id,
+          at: p.at,
+        });
+        break;
+      }
+      case 'OBJECTION_MATERIAL_APPENDED': {
+        const obj = s.objections.get(p.objectionId);
+        obj.materials.push({
+          seq: p.seq,
+          summary: p.summary,
+          content: p.content,
+          attachedAt: p.at,
+          requestId: p.requestId,
+        });
+        s.objectionRequests.set(p.requestId, {
+          kind: 'MATERIAL',
+          bodyHash: p.bodyHash,
+          objectionId: p.objectionId,
+          materialSeq: p.seq,
+          at: p.at,
+        });
+        break;
+      }
+      case 'OBJECTION_REVIEWED': {
+        const obj = s.objections.get(p.objectionId);
+        obj.status = p.decision;
+        obj.review = {
+          decision: p.decision,
+          rationale: p.rationale,
+          reviewerId: p.reviewerId,
+          reviewedAt: p.at,
+        };
+        break;
+      }
       default:
         break;
     }
@@ -293,6 +361,12 @@ export class Kernel {
         return this.backfillActuals(cmd, now);
       case 'SET_METER_OFFLINE':
         return this.setMeterOffline(cmd, now);
+      case 'FILE_OBJECTION':
+        return this.fileObjection(cmd, now);
+      case 'APPEND_OBJECTION_MATERIAL':
+        return this.appendObjectionMaterial(cmd, now);
+      case 'REVIEW_OBJECTION':
+        return this.reviewObjection(cmd, now);
       case 'TICK':
         return this.tick(cmd.minutes ?? 15, now);
       case 'RESET':
@@ -799,6 +873,197 @@ export class Kernel {
     return { meterId: cmd.meterId, offline };
   }
 
+  // ---------- 履约异议处置 ----------
+  //
+  // 标的是一份【已封存裁定】（REPORT_ISSUED 落链后即为封存），异议只锚定其
+  // 编号（eventId + reportVersion / reportId）与内容指纹（report.hash）。
+  // 迟到计量数据产生新裁定时是另一个标的：旧异议不转移、新标的可单独受理；
+  // 异议受理不允许回写被质疑的报告（v1 字节级保持不变）。
+
+  #resolveTargetReport(eventId, reportVersion) {
+    this.requireEvent(eventId);
+    const reports = this.s.reports.get(eventId);
+    if (!reports?.length) throw new DomainError('REPORT_NOT_SEALED', '该事件尚无已封存裁定，不能提起异议');
+    const v = Number(reportVersion) || reports.at(-1).version;
+    const report = reports.find((r) => r.version === v);
+    if (!report) throw new DomainError('NOT_FOUND', `裁定 v${v} 不存在`, { eventId, reportVersion: v });
+    return report;
+  }
+
+  #objectionTargetKey(eventId, reportVersion) {
+    return `${eventId}:v${reportVersion}`;
+  }
+
+  // 客户请求号幂等：同号且同正文 -> 返回原结果（idempotent:true）；同号不同正文 -> 409。
+  #idempotentRequest(requestId, body) {
+    if (!requestId) return null;
+    const seen = this.s.objectionRequests.get(requestId);
+    if (!seen) return null;
+    const bodyHash = sha256Hex(canonicalJSON(body));
+    if (seen.bodyHash !== bodyHash) {
+      throw new DomainError('IDEMPOTENCY_CONFLICT',
+        '客户请求号重复但请求正文不同（409）：请使用新的请求号，或原样重发', {
+          requestId, originalKind: seen.kind, originalObjectionId: seen.objectionId,
+        });
+    }
+    return seen;
+  }
+
+  fileObjection(cmd, now) {
+    const requestId = cmd.requestId ? String(cmd.requestId) : null;
+    if (!requestId) throw new DomainError('BAD_REQUEST', '缺少客户请求号 requestId（重复请求去重所必需）');
+    const reason = typeof cmd.reason === 'string' ? cmd.reason.trim() : '';
+    if (!reason) throw new DomainError('BAD_REQUEST', '异议理由不能为空');
+    const aggregatorId = String(cmd.aggregatorId || '');
+    if (!this.s.aggregators.has(aggregatorId)) {
+      throw new DomainError('NOT_FOUND', `代理商 ${aggregatorId} 不存在`, { aggregatorId });
+    }
+    // 幂等必须先于存在性/业务校验：同号重放即使原标的已不可提，也要原样返回原结果。
+    const body = {
+      eventId: String(cmd.eventId || ''),
+      reportVersion: Number(cmd.reportVersion) || null,
+      reportHash: cmd.reportHash ? String(cmd.reportHash) : null,
+      aggregatorId,
+      reason,
+    };
+    const seen = this.#idempotentRequest(requestId, body);
+    if (seen) {
+      return { idempotent: true, requestId, objection: this.objectionView(seen.objectionId) };
+    }
+
+    const report = this.#resolveTargetReport(cmd.eventId, cmd.reportVersion);
+    const submittedHash = cmd.reportHash === undefined ? report.hash : String(cmd.reportHash);
+    if (cmd.reportHash !== undefined && !HASH64_RE.test(submittedHash)) {
+      throw new DomainError('BAD_REQUEST', '内容指纹必须是 64 位十六进制 sha256');
+    }
+    if (submittedHash !== report.hash) {
+      throw new DomainError('FINGERPRINT_MISMATCH',
+        `提交的内容指纹与封存裁定 ${report.reportId} 不一致`, {
+          eventId: report.eventId, reportVersion: report.version,
+          expectedHash: report.hash, submittedHash,
+        });
+    }
+    // 时限：必须在截止时刻前（含截止时刻）。
+    const deadlineMs = report.issuedAt + OBJECTION_WINDOW_MS;
+    if (now > deadlineMs) {
+      throw new DomainError('OBJECTION_DEADLINE_PASSED', '异议受理时限已过', {
+        target: this.#objectionTargetKey(report.eventId, report.version),
+        deadlineMs, now,
+      });
+    }
+    // 同一代理商对同一标的只允许一个待处理实例。
+    for (const obj of this.s.objections.values()) {
+      const sameTarget = obj.eventId === report.eventId && obj.reportVersion === report.version;
+      if (sameTarget && obj.aggregatorId === aggregatorId && obj.status === 'PENDING') {
+        throw new DomainError('DUPLICATE_PENDING_OBJECTION',
+          '该代理商对此标的已有待处理异议；审核出结论前不得重复提起', {
+            existingObjectionId: obj.id, target: this.#objectionTargetKey(report.eventId, report.version),
+          });
+      }
+    }
+
+    const id = cmd.objectionId || uid('OBJ');
+    const payload = {
+      id,
+      requestId,
+      eventId: report.eventId,
+      reportVersion: report.version,
+      reportId: report.reportId,
+      reportHash: report.hash,
+      verdict: report.verdict,
+      aggregatorId,
+      reason,
+      bodyHash: sha256Hex(canonicalJSON(body)),
+      at: now,
+      deadlineMs,
+    };
+    this.store.append('OBJECTION_FILED', payload, now);
+    this.apply(this.store.all().at(-1));
+    return { filed: true, idempotent: false, requestId, objection: this.objectionView(id) };
+  }
+
+  appendObjectionMaterial(cmd, now) {
+    const requestId = cmd.requestId ? String(cmd.requestId) : null;
+    if (!requestId) throw new DomainError('BAD_REQUEST', '缺少客户请求号 requestId（重复请求去重所必需）');
+    const obj = this.requireObjection(cmd.objectionId);
+    if (obj.aggregatorId !== cmd.aggregatorId) {
+      throw new DomainError('NOT_OBJECTION_OWNER', '只有提起该异议的代理商可以补充材料', {
+        objectionId: obj.id, ownerAggregatorId: obj.aggregatorId,
+      });
+    }
+    const summary = typeof cmd.summary === 'string' ? cmd.summary.trim() : '';
+    const content = typeof cmd.content === 'string' ? cmd.content.trim() : '';
+    if (!summary && !content) throw new DomainError('BAD_REQUEST', '补充材料必须包含摘要或正文');
+
+    const body = {
+      objectionId: obj.id,
+      aggregatorId: String(cmd.aggregatorId || ''),
+      summary,
+      content,
+    };
+    const seen = this.#idempotentRequest(requestId, body);
+    if (seen) {
+      return { idempotent: true, requestId, objection: this.objectionView(obj.id), materialSeq: seen.materialSeq };
+    }
+    // 补充材料只能在待处理期间顺序追加：审核一经通过/驳回即封卷。
+    if (obj.status !== 'PENDING') {
+      throw new DomainError('OBJECTION_ALREADY_DECIDED',
+        `异议已${obj.status === 'APPROVED' ? '通过' : '驳回'}，不能再补充材料`, { status: obj.status });
+    }
+
+    const seq = obj.materials.length + 1;
+    const payload = {
+      objectionId: obj.id,
+      eventId: obj.eventId,
+      reportVersion: obj.reportVersion,
+      requestId,
+      seq,
+      summary: summary.slice(0, 200),
+      content: content.slice(0, 20000),
+      bodyHash: sha256Hex(canonicalJSON(body)),
+      at: now,
+    };
+    this.store.append('OBJECTION_MATERIAL_APPENDED', payload, now);
+    this.apply(this.store.all().at(-1));
+    return { appended: true, idempotent: false, requestId, materialSeq: seq, objection: this.objectionView(obj.id) };
+  }
+
+  reviewObjection(cmd, now) {
+    const obj = this.requireObjection(cmd.objectionId);
+    const decision = String(cmd.decision || '').toUpperCase();
+    if (!REVIEW_DECISIONS.includes(decision)) {
+      throw new DomainError('BAD_REQUEST', `审核结论必须是 ${REVIEW_DECISIONS.join('/')}`);
+    }
+    // 审核一经通过或驳回便不可再次裁定（终态机，禁止任何二次裁决/改写）。
+    if (obj.status !== 'PENDING') {
+      throw new DomainError('OBJECTION_ALREADY_DECIDED',
+        `异议已有结论 ${obj.status}，不可再次裁定`, { status: obj.status, existingReview: obj.review });
+    }
+    const rationale = typeof cmd.rationale === 'string' ? cmd.rationale.trim() : '';
+    if (!rationale) throw new DomainError('BAD_REQUEST', '审核意见不能为空');
+
+    const payload = {
+      objectionId: obj.id,
+      eventId: obj.eventId,
+      reportVersion: obj.reportVersion,
+      target: this.#objectionTargetKey(obj.eventId, obj.reportVersion),
+      decision,
+      rationale: rationale.slice(0, 2000),
+      reviewerId: cmd.reviewerId ? String(cmd.reviewerId).slice(0, 64) : 'OPS',
+      at: now,
+    };
+    this.store.append('OBJECTION_REVIEWED', payload, now);
+    this.apply(this.store.all().at(-1));
+    // 结论只作用于异议卷宗：被质疑的原始裁定内容绝不修改。
+    return { decided: true, objection: this.objectionView(obj.id) };
+  }
+
+  requireObjection(id) {
+    const obj = this.s.objections.get(id);
+    if (!obj) throw new DomainError('NOT_FOUND', `异议 ${id} 不存在`, { objectionId: id });
+    return obj;
+  }
+
   // ---------- 仿真推进 ----------
 
   tick(minutes, prevNow) {
@@ -900,6 +1165,41 @@ export class Kernel {
     return report;
   }
 
+  // ---------- 异议视图 ----------
+
+  objectionView(id) {
+    const obj = this.s.objections.get(id);
+    if (!obj) return null;
+    const now = this.now();
+    const report = this.s.reports.get(obj.eventId)?.find((r) => r.version === obj.reportVersion) || null;
+    return {
+      id: obj.id,
+      eventId: obj.eventId,
+      reportVersion: obj.reportVersion,
+      reportId: obj.reportId,
+      target: this.#objectionTargetKey(obj.eventId, obj.reportVersion),
+      reportHash: obj.reportHash,
+      reportVerdict: obj.verdict || report?.verdict || null,
+      // 指纹仍与当前链上同版裁定一致：异议不修改原始内容；新版本是另一个标的。
+      targetIntact: report ? report.hash === obj.reportHash : false,
+      aggregatorId: obj.aggregatorId,
+      reason: obj.reason,
+      status: obj.status,
+      filedAt: obj.filedAt,
+      filedIso: iso(obj.filedAt),
+      deadlineMs: obj.deadlineMs,
+      deadlineIso: iso(obj.deadlineMs),
+      overdue: now > obj.deadlineMs,
+      materials: obj.materials.map((m) => ({ ...m, attachedIso: iso(m.attachedAt) })),
+      materialCount: obj.materials.length,
+      review: obj.review ? { ...obj.review, reviewedIso: iso(obj.review.reviewedAt) } : null,
+    };
+  }
+
+  objectionListView() {
+    return this.s.objectionIds.map((id) => this.objectionView(id));
+  }
+
   // ---------- 视图 ----------
 
   eventView(id) {
@@ -930,7 +1230,17 @@ export class Kernel {
         reportId: r.reportId, version: r.version, kind: r.kind, verdict: r.verdict,
         reductionKwh: r.reductionKwh, targetKwh: r.targetKwh, deliveryRatio: r.deliveryRatio,
         gapCount: r.gapCount, baselineVersion: r.baselineVersion, issuedAt: r.issuedAt, hash: r.hash,
+        objectionDeadlineMs: r.issuedAt + OBJECTION_WINDOW_MS,
       })),
+      objections: [...(this.s.objectionsByEvent.get(id) || [])].map((oid) => {
+        const o = this.objectionView(oid);
+        return {
+          id: o.id, reportVersion: o.reportVersion, target: o.target, aggregatorId: o.aggregatorId,
+          status: o.status, filedAt: o.filedAt, deadlineMs: o.deadlineMs, overdue: o.overdue,
+          materialCount: o.materialCount, targetIntact: o.targetIntact,
+          review: o.review ? { decision: o.review.decision, reviewedAt: o.review.reviewedAt } : null,
+        };
+      }),
     };
   }
 
@@ -960,6 +1270,8 @@ export class Kernel {
         };
       }),
       events: [...this.s.events.values()].map((e) => this.eventView(e.id)),
+      objections: this.objectionListView(),
+      objectionWindowMs: OBJECTION_WINDOW_MS,
       chain: this.store.verify(),
     };
   }

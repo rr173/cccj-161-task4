@@ -133,6 +133,118 @@ function check(name, cond, extra = '') {
   const vf = await api(`/api/reports/${id}/versions/2/verify`, null, 'GET');
   check('v2 报告可独立重算指纹', vf.bodyHashMatches);
 
+  console.log('场景 I：履约异议处置（标的/时限/幂等/唯一待处理/顺序材料/终态/新标的）');
+  const v1Hash2 = v1After.hash;
+  // 1. 受理：AGG-A 对已封存 v1 以编号+指纹提起
+  const f1 = await api('/api/objections', {
+    requestId: 'E2E-OBJ-1', eventId: id, reportVersion: 1, reportHash: v1Hash2,
+    aggregatorId: 'AGG-A', reason: 'D-4 缺日导致基线偏高，削减被低估',
+  });
+  check('异议受理（201，PENDING）', f1.filed === true && f1.objection.status === 'PENDING');
+  check('标的编号/指纹锚定', f1.objection.target === `${id}:v1` && f1.objection.reportHash === v1Hash2);
+  check('截止时刻 = 封存后 24h', f1.objection.deadlineMs === v1After.issuedAt + 24 * 3600000);
+  const oid = f1.objection.id;
+
+  // 2. 请求号幂等：同号同正文返回原结果；同号不同正文 409
+  const f1dup = await api('/api/objections', {
+    requestId: 'E2E-OBJ-1', eventId: id, reportVersion: 1, reportHash: v1Hash2,
+    aggregatorId: 'AGG-A', reason: 'D-4 缺日导致基线偏高，削减被低估',
+  });
+  check('同请求号同正文幂等返回原实例', f1dup.idempotent === true && f1dup.objection.id === oid);
+  let conflict;
+  try {
+    await api('/api/objections', {
+      requestId: 'E2E-OBJ-1', eventId: id, reportVersion: 1, reportHash: v1Hash2,
+      aggregatorId: 'AGG-A', reason: '正文不一样！',
+    });
+  } catch (e) { conflict = e; }
+  check('同请求号不同正文 -> 409', conflict?.status === 409 && conflict.code === 'IDEMPOTENCY_CONFLICT', conflict?.code);
+
+  // 3. 指纹不符 -> 409
+  let fpErr;
+  try {
+    await api('/api/objections', {
+      requestId: 'E2E-OBJ-FP', eventId: id, reportVersion: 1, reportHash: 'a'.repeat(64),
+      aggregatorId: 'AGG-A', reason: 'x',
+    });
+  } catch (e) { fpErr = e; }
+  check('内容指纹不符 -> FINGERPRINT_MISMATCH', fpErr?.code === 'FINGERPRINT_MISMATCH', fpErr?.code);
+
+  // 4. 同一代理商同一标的唯一待处理
+  let dupPending;
+  try {
+    await api('/api/objections', {
+      requestId: 'E2E-OBJ-2', eventId: id, reportVersion: 1, reportHash: v1Hash2,
+      aggregatorId: 'AGG-A', reason: '重复提起',
+    });
+  } catch (e) { dupPending = e; }
+  check('同一代理商重复待处理 -> DUPLICATE_PENDING_OBJECTION',
+    dupPending?.code === 'DUPLICATE_PENDING_OBJECTION', dupPending?.code);
+  // 另一代理商可单独提起
+  const fB = await api('/api/objections', {
+    requestId: 'E2E-OBJ-B', eventId: id, reportVersion: 1, reportHash: v1Hash2,
+    aggregatorId: 'AGG-B', reason: 'AGG-B 独立异议',
+  });
+  check('另一代理商对同一标的可受理', fB.filed === true && fB.objection.id !== oid);
+
+  // 5. 材料顺序追加 + 各自请求号幂等/409
+  const m1 = await api(`/api/objections/${oid}/materials`, {
+    requestId: 'E2E-M-1', aggregatorId: 'AGG-A', summary: '第三方校验证书', content: 'C-001',
+  });
+  const m2 = await api(`/api/objections/${oid}/materials`, {
+    requestId: 'E2E-M-2', aggregatorId: 'AGG-A', summary: '补送曲线截图', content: 'IMG-2',
+  });
+  check('材料严格顺序 #1 #2', m1.materialSeq === 1 && m2.materialSeq === 2);
+  const m1dup = await api(`/api/objections/${oid}/materials`, {
+    requestId: 'E2E-M-1', aggregatorId: 'AGG-A', summary: '第三方校验证书', content: 'C-001',
+  });
+  check('材料请求号幂等', m1dup.idempotent === true && m1dup.materialSeq === 1);
+  let matConflict;
+  try {
+    await api(`/api/objections/${oid}/materials`, {
+      requestId: 'E2E-M-1', aggregatorId: 'AGG-A', summary: '改写过的正文', content: 'C-001',
+    });
+  } catch (e) { matConflict = e; }
+  check('材料同号不同正文 -> 409', matConflict?.code === 'IDEMPOTENCY_CONFLICT', matConflict?.code);
+  let ownerErr;
+  try {
+    await api(`/api/objections/${oid}/materials`, {
+      requestId: 'E2E-M-X', aggregatorId: 'AGG-B', summary: '越权',
+    });
+  } catch (e) { ownerErr = e; }
+  check('非所有者补充材料 -> 403', ownerErr?.status === 403 && ownerErr.code === 'NOT_OBJECTION_OWNER', ownerErr?.code);
+
+  // 6. 审核驳回即终态：不能再次裁定、不能再补料；原报告字节不变
+  await api(`/api/objections/${oid}/review`, { decision: 'REJECTED', rationale: '现有证据不足以推翻 v1' });
+  let reReview;
+  try { await api(`/api/objections/${oid}/review`, { decision: 'APPROVED', rationale: '改判' }); }
+  catch (e) { reReview = e; }
+  check('终态后再次裁定被拒', reReview?.code === 'OBJECTION_ALREADY_DECIDED', reReview?.code);
+  let lateMat;
+  try {
+    await api(`/api/objections/${oid}/materials`, { requestId: 'E2E-M-3', aggregatorId: 'AGG-A', summary: '结案后' });
+  } catch (e) { lateMat = e; }
+  check('结案后补充材料被拒', lateMat?.code === 'OBJECTION_ALREADY_DECIDED', lateMat?.code);
+  const v1Final = await api(`/api/reports/${id}/versions/1`, null, 'GET');
+  check('被质疑的原始裁定内容未被修改（指纹恒定）', v1Final.hash === v1Hash2);
+
+  // 7. 新标的（v2 订正）可单独受理；旧异议仍指向 v1 不转移
+  const v2r = await api(`/api/reports/${id}/versions/2`, null, 'GET');
+  const fV2 = await api('/api/objections', {
+    requestId: 'E2E-OBJ-V2', eventId: id, reportVersion: 2, reportHash: v2r.hash,
+    aggregatorId: 'AGG-A', reason: '对新裁定 v2 的异议',
+  });
+  check('新标的 v2 可单独受理（驳回 v1 不影响）', fV2.filed === true && fV2.objection.target === `${id}:v2`);
+  const oldView = await api(`/api/objections/${oid}`, null, 'GET');
+  check('旧异议继续指向原标的 v1', oldView.target === `${id}:v1` && oldView.reportHash === v1Hash2 &&
+    oldView.status === 'REJECTED' && oldView.targetIntact === true);
+
+  // 8. 历史视图 + 哈希链
+  const list = await api('/api/objections?aggregatorId=AGG-A', null, 'GET');
+  check('异议历史可查（AGG-A：v1 驳回 + v2 待处理，共 2 条）', list.count === 2);
+  const chain2 = await api('/api/chain/verify', null, 'GET');
+  check('异议记录上链后哈希链仍完整', chain2.ok, `length=${chain2.length}`);
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('E2E 异常', e); process.exit(1); });

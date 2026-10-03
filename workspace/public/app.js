@@ -1,6 +1,8 @@
 /* 运营台前端：原生 JS，轮询 /api/state，所有写操作走事件 API。 */
 let STATE = null;
 let selectedEvent = null;
+let selectedObjection = null;
+let objFilter = '';
 let timer = null;
 
 const $ = (id) => document.getElementById(id);
@@ -47,6 +49,7 @@ function render() {
   renderDetail();
   renderReports();
   renderChain();
+  renderObjectionDesk();
   if (!$('evMeter').dataset.filled) {
     $('evMeter').innerHTML = STATE.meters.map((m) => `<option value="${m.id}">${m.id} · ${m.name}</option>`).join('');
     $('evMeter').dataset.filled = '1';
@@ -431,6 +434,200 @@ async function loadLog() {
   $('miniLog').textContent = r.records.slice().reverse().map((x) =>
     `#${String(x.seq).padStart(3, '0')} ${new Date(x.ts || 0).toISOString().slice(11, 16)} ${x.type.padEnd(20)} ${JSON.stringify(x.payload).slice(0, 90)}`
   ).join('\n');
+}
+
+// ---------- 履约异议处置台 ----------
+
+// 已封存裁定 = 各事件下 kind 任意但已 REPORT_ISSUED（v1 原始 / v2+ 订正都是独立标的）
+function sealedTargets() {
+  const out = [];
+  for (const ev of STATE.events) {
+    for (const r of ev.reports) {
+      out.push({ ev, r });
+    }
+  }
+  out.sort((a, b) => a.r.issuedAt - b.r.issuedAt);
+  return out;
+}
+
+function renderObjectionDesk() {
+  if (!$('objAgg').dataset.filled) {
+    $('objAgg').innerHTML = STATE.aggregators.map((a) => `<option value="${a.id}">${a.id} · ${a.name}</option>`).join('');
+    $('objAgg').dataset.filled = '1';
+    $('objAgg').addEventListener('change', renderTargetSelect);
+    $('objTarget').addEventListener('change', fillTargetHash);
+    $('objReqId').value = 'REQ-' + Math.random().toString(16).slice(2, 10);
+  }
+  renderTargetSelect();
+  renderObjections();
+  renderObjectionDetail();
+}
+
+function renderTargetSelect() {
+  const agg = $('objAgg').value;
+  const targets = sealedTargets();
+  // 仅在可选项集合变化时重建下拉，避免轮询打断用户展开的下拉框
+  const sig = agg + '|' + targets.map(({ ev, r }) => `${ev.id}@${r.version}:${ev.objections.some((o) => o.aggregatorId === agg && o.reportVersion === r.version && o.status === 'PENDING') ? 1 : 0}`).join(',');
+  if ($('objTarget').dataset.sig === sig) return;
+  $('objTarget').dataset.sig = sig;
+  const prev = $('objTarget').value;
+  $('objTarget').innerHTML = targets.length
+    ? targets.map(({ ev, r }) => {
+        const pending = (ev.objections || []).some((o) => o.aggregatorId === agg && o.reportVersion === r.version && o.status === 'PENDING');
+        const label = `${ev.id} v${r.version} ${r.kind === 'ORIGINAL' ? '原始' : '订正'}·${r.verdict}`;
+        return `<option value="${ev.id}@${r.version}">${label}${pending ? '（该代理商已有待处理）' : ''}</option>`;
+      }).join('')
+    : '<option value="">（尚无已封存裁定：先结束一个事件）</option>';
+  if ([...$('objTarget').options].some((o) => o.value === prev)) $('objTarget').value = prev;
+  fillTargetHash();
+}
+
+function selectedTarget() {
+  const v = $('objTarget').value;
+  if (!v || !v.includes('@')) return null;
+  const [eventId, ver] = v.split('@');
+  const ev = STATE.events.find((e) => e.id === eventId);
+  const r = ev?.reports.find((x) => x.version === Number(ver));
+  return ev && r ? { ev, r } : null;
+}
+
+function fillTargetHash() {
+  const t = selectedTarget();
+  if (!t) { $('objHash').value = ''; $('objTargetInfo').textContent = ''; return; }
+  $('objHash').value = t.r.hash;
+  const deadline = t.r.issuedAt + STATE.objectionWindowMs;
+  const left = deadline - STATE.now;
+  const cls = left < 0 ? 'deadline-warn' : 'deadline-ok';
+  $('objTargetInfo').innerHTML =
+    `标的编号 ${t.r.reportId} · 裁定 <b>${t.r.verdict}</b><br>` +
+    `封存于 ${fmtTs(t.r.issuedAt)} · 截止 ${fmtTs(deadline)}<br>` +
+    `<span class="${cls}">${left < 0 ? '⏰ 受理时限已过' : '⏳ 距截止 ' + Math.round(left / 3600000) + ' 小时'}</span>`;
+}
+
+function renderObjections() {
+  let list = STATE.objections || [];
+  if (objFilter === 'PENDING') list = list.filter((o) => o.status === 'PENDING');
+  if (objFilter === 'DONE') list = list.filter((o) => o.status !== 'PENDING');
+  list = [...list].sort((a, b) => b.filedAt - a.filedAt);
+  $('objCount').textContent = list.length;
+  if (!list.length) { $('objections').innerHTML = '<div class="muted">无匹配异议。</div>'; return; }
+  $('objections').innerHTML = list.map((o) => `
+    <div class="obj-card ${o.status} ${selectedObjection === o.id ? 'selected' : ''}" onclick="selectObjection('${o.id}')">
+      <div class="row" style="justify-content:space-between">
+        <b>${o.id}</b> ${statusTag(o.status)}
+      </div>
+      <div class="muted mono" style="font-size:11.5px;margin:3px 0">
+        标的 ${o.target}<br>${o.aggregatorId} · 材料 ${o.materialCount} 份
+      </div>
+      <div class="muted" style="font-size:11.5px">
+        ${o.overdue && o.status === 'PENDING' ? '<span class="tag OVERDUE">超时限</span> ' : ''}
+        ${o.targetIntact ? '<span class="deadline-ok">原标的指纹一致</span>' : '<span class="deadline-warn">已有更新版本（旧标的不变）</span>'}
+      </div>
+    </div>`).join('');
+}
+
+function selectObjection(id) { selectedObjection = id; renderObjections(); renderObjectionDetail(); }
+
+function renderObjectionDetail() {
+  const el = $('objDetail');
+  const o = (STATE.objections || []).find((x) => x.id === selectedObjection);
+  if (!o) { el.className = 'muted'; el.textContent = '在中间选择一个异议实例。'; return; }
+  // 用户正在材料/审核输入框中填写时，轮询不要重绘卷宗（保留未提交输入与焦点）。
+  const active = document.activeElement;
+  if (active && el.contains(active)) return;
+  el.className = '';
+  const decisionTag = statusTag(o.status);
+  el.innerHTML = `
+    <div class="row" style="justify-content:space-between">
+      <b>${o.id}</b> ${decisionTag}
+    </div>
+    <dl class="kv" style="margin-top:6px">
+      <dt>标的编号</dt><dd class="mono">${o.target}</dd>
+      <dt>内容指纹</dt><dd class="mono" style="font-size:10px">${o.reportHash.slice(0, 24)}…</dd>
+      <dt>原裁定</dt><dd>${o.reportVerdict || '—'} · ${o.targetIntact ? '未被修改' : '存在新版本，旧标的不变'}</dd>
+      <dt>代理商</dt><dd>${o.aggregatorId}</dd>
+      <dt>提起于</dt><dd>${fmtTs(o.filedAt)}</dd>
+      <dt>受理截止</dt><dd class="${o.overdue ? 'deadline-warn' : ''}">${fmtTs(o.deadlineMs)}${o.overdue ? '（已过）' : ''}</dd>
+    </dl>
+    <div style="margin-top:6px"><b>异议理由</b><div class="muted" style="white-space:pre-wrap">${escHtml(o.reason)}</div></div>
+
+    <h3>补充材料（严格顺序追加，#${o.materialCount}）</h3>
+    ${o.materials.length ? o.materials.map((m) => `
+      <div class="mat-item"><span class="mat-seq">#${m.seq}</span> ${escHtml(m.summary || '')}
+        <div class="muted">${fmtTs(m.attachedAt)} · <span class="mono">${escHtml(m.requestId)}</span></div>
+        ${m.content ? `<div class="muted" style="white-space:pre-wrap;margin-top:3px">${escHtml(m.content)}</div>` : ''}
+      </div>`).join('') : '<div class="muted">尚未补充材料。</div>'}
+    ${o.status === 'PENDING' ? `
+      <div style="margin-top:8px">
+        <label>补充材料摘要</label><input id="matSummary" placeholder="例如：第三方校验证书 #C-2026-0918">
+        <label>材料正文</label><textarea id="matContent" rows="2"></textarea>
+        <label>客户请求号 requestId（顺序追加各自去重）</label>
+        <input id="matReqId" value="REQ-${Math.random().toString(16).slice(2, 10)}">
+        <div style="margin-top:6px"><button class="primary" onclick="addMaterial('${o.id}')">顺序追加材料</button></div>
+      </div>
+      <h3>运营方审核（通过/驳回即终态，不可再次裁定）</h3>
+      <textarea id="reviewNote" rows="2" placeholder="审核意见（必填）"></textarea>
+      <div class="row" style="margin-top:6px">
+        <button class="good" onclick="reviewObjection('${o.id}','APPROVED')">审核通过</button>
+        <button class="bad" onclick="reviewObjection('${o.id}','REJECTED')">驳回</button>
+      </div>` : `
+      <h3>审核结论（终态）</h3>
+      <div class="card ${o.review.decision === 'APPROVED' ? 'active' : 'recalled'}">
+        ${statusTag(o.review.decision)} <b>${escHtml(o.review.reviewerId)}</b> · ${fmtTs(o.review.reviewedAt)}
+        <div class="muted" style="white-space:pre-wrap;margin-top:4px">${escHtml(o.review.rationale)}</div>
+      </div>
+      <div class="muted" style="font-size:11.5px">封卷后不可再次裁定；被质疑的原始裁定内容未被修改（指纹 ${o.targetIntact ? '保持一致' : '仍锚定原版本'}）。</div>`}
+  `;
+}
+
+function escHtml(s) {
+  return String(s ?? '').replace(/[<>&"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+async function fileObjection() {
+  const t = selectedTarget();
+  if (!t) return toast('请先选择已封存裁定（结束事件后产生）', 'err');
+  const agg = $('objAgg').value;
+  try {
+    const r = await api('/api/objections', {
+      requestId: $('objReqId').value.trim() || undefined,
+      eventId: t.ev.id,
+      reportVersion: t.r.version,
+      reportHash: t.r.hash,
+      aggregatorId: agg,
+      reason: $('objReason').value,
+    });
+    selectedObjection = r.objection.id;
+    toast(`${r.idempotent ? '原结果幂等返回' : '异议已受理'}：<b>${r.objection.id}</b>，标的 ${r.objection.target}，截止 ${r.objection.deadlineIso.slice(0, 16)}`, 'ok');
+    $('objReason').value = '';
+    $('objReqId').value = 'REQ-' + Math.random().toString(16).slice(2, 10);
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function addMaterial(objectionId) {
+  const o = STATE.objections.find((x) => x.id === objectionId);
+  try {
+    const r = await api(`/api/objections/${objectionId}/materials`, {
+      requestId: $('matReqId').value.trim() || undefined,
+      aggregatorId: o.aggregatorId,
+      summary: $('matSummary').value,
+      content: $('matContent').value,
+    });
+    toast(`${r.idempotent ? '原结果幂等返回' : `材料 #${r.materialSeq} 已顺序追加`}（共 ${r.objection.materialCount} 份）`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function reviewObjection(objectionId, decision) {
+  const rationale = $('reviewNote').value.trim();
+  if (!rationale) return toast('审核意见必填', 'err');
+  if (!confirm(`确认${decision === 'APPROVED' ? '通过' : '驳回'}该异议？结论一经作出即不可再次裁定。`)) return;
+  try {
+    const r = await api(`/api/objections/${objectionId}/review`, { decision, rationale, reviewerId: 'OPS' });
+    toast(`异议 <b>${r.objection.id}</b> 已${decision === 'APPROVED' ? '通过' : '驳回'}（终态，原裁定未修改）`, decision === 'APPROVED' ? 'ok' : 'err');
+    refresh();
+  } catch (e) { errToast(e); }
 }
 
 refresh();

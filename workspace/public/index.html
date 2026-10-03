@@ -79,6 +79,22 @@
   .quarantine-banner b { color:#ff9d9d; }
   .quarantine-banner .mono { color:#ffd9d9; }
   .recovered-banner { margin:0; padding:8px 22px; background:#3d2f10; border-bottom:1px solid var(--warn); color:#f5d98a; font-size:12.5px; }
+  /* 履约异议处置台 */
+  .obj-wrap { padding:0 22px 22px; }
+  .obj-grid { display:grid; grid-template-columns:320px 1fr 360px; gap:14px; align-items:start; }
+  .tag.PENDING { background:#13315c; color:#8fc2ff; }
+  .tag.APPROVED { background:#0f3a2a; color:#5fe3ac; }
+  .tag.REJECTED { background:#3f1d1d; color:#ff9d9d; }
+  .tag.OVERDUE { background:#3d2f10; color:#f5c451; }
+  .obj-card { background:var(--panel2); border:1px solid var(--line); border-radius:9px; padding:10px 11px; margin-bottom:8px; cursor:pointer; }
+  .obj-card.selected { border-color:var(--violet); box-shadow:0 0 0 1px rgba(181,140,255,.3); }
+  .obj-card.PENDING { border-left:3px solid var(--accent); }
+  .obj-card.APPROVED { border-left:3px solid var(--ok); }
+  .obj-card.REJECTED { border-left:3px solid var(--bad); }
+  .mat-item { background:#0c1320; border:1px solid var(--line); border-radius:7px; padding:7px 9px; margin:6px 0; font-size:12px; }
+  .mat-seq { color:var(--cyan); font-weight:700; }
+  .deadline-warn { color:var(--warn); font-weight:700; }
+  .deadline-ok { color:var(--ok); }
 </style>
 </head>
 <body>
@@ -172,6 +188,49 @@
       <h2>近期裁决日志</h2>
       <pre class="log" id="miniLog">（点击“校验/日志”加载）</pre>
       <button class="ghost" onclick="loadLog()">刷新裁决日志</button>
+    </div>
+  </div>
+</div>
+
+<div class="obj-wrap">
+  <div class="panel" style="margin-bottom:14px">
+    <h2>⚖️ 履约异议处置台（代理商提起异议 · 顺序补充材料 · 运营方审核 · 历史可溯）</h2>
+    <div class="muted">
+      异议标的为<b>已封存裁定</b>的编号与内容指纹；同请求号同正文返回原结果、正文不同返回 409；
+      同一代理商对同一标的仅一个待处理实例；材料只能顺序追加；通过/驳回即终态，不可再次裁定，原始裁定不被修改。
+      迟到计量产生新裁定时旧异议仍指向原标的，新标的可单独受理。
+    </div>
+  </div>
+  <div class="obj-grid">
+    <div class="panel">
+      <h2>③ 代理商提起异议</h2>
+      <label>代理商（资源代理商）</label>
+      <select id="objAgg"></select>
+      <label>被质疑的已封存裁定</label>
+      <select id="objTarget"></select>
+      <div id="objTargetInfo" class="muted mono" style="font-size:11px;margin:4px 0"></div>
+      <label>内容指纹（自动取自封存裁定，可核对）</label>
+      <input id="objHash" class="mono" style="font-size:10.5px" readonly>
+      <label>客户请求号 requestId（同号同正文幂等；同号不同正文 409）</label>
+      <input id="objReqId" placeholder="留空自动生成">
+      <label>异议理由（正文）</label>
+      <textarea id="objReason" rows="3" placeholder="例如：D-4 历史读数缺失导致基线偏高，实际削减被低估……"></textarea>
+      <div style="margin-top:8px"><button class="primary" onclick="fileObjection()">在截止时刻前提起异议</button></div>
+    </div>
+
+    <div class="panel">
+      <h2>异议实例（点击查看 · <span id="objCount">0</span>）</h2>
+      <div class="row" style="margin-bottom:8px">
+        <button class="ghost" id="objFilterAll" onclick="objFilter='';renderObjections()">全部</button>
+        <button class="ghost" id="objFilterPending" onclick="objFilter='PENDING';renderObjections()">待处理</button>
+        <button class="ghost" id="objFilterDone" onclick="objFilter='DONE';renderObjections()">已结案</button>
+      </div>
+      <div id="objections"><div class="muted">尚无异议。</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>异议卷宗 / 审核</h2>
+      <div id="objDetail" class="muted">在中间选择一个异议实例。</div>
     </div>
   </div>
 </div>

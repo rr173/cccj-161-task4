@@ -5,8 +5,8 @@
 指令撤销与设备执行并发、回执乱序、通信中断等场景下，**一台设备同一时刻只归属一个有效事件，并保持明确水位**。
 
 - 零依赖、纯 Node.js（≥ 20），无数据库、无构建步骤。
-- **事件溯源 + SHA-256 哈希链**：所有裁决（发布、冻结、声明、回执、撤销、读数、报告）都是只增记录，可独立核验；任何历史篡改都会被检出。
-- 仿真时钟：时间只由 `/api/sim/tick` 推进，裁决、迟到数据、订正版本完全可重复演示。
+- **事件溯源 + SHA-256 哈希链**：所有裁决（发布、冻结、声明、回执、撤销、读数、报告、**履约异议**）都是只增记录，可独立核验；任何历史篡改都会被检出。
+- 仿真时钟：时间只由 `/api/sim/tick` 推进，裁决、迟到数据、订正版本、**异议时限**完全可重复演示。
 
 ## 快速开始
 
@@ -15,9 +15,9 @@ npm start                 # http://localhost:8080
 # 可选：PORT=8080 DR_MEMORY=1 npm start   # 纯内存，不落盘
 ```
 
-- 设备执行页面（运营台）：http://localhost:8080/
-- 自动化测试：`npm test`（39 个领域/恢复单测，含 12 个通知投递契约）
-- 端到端场景：先 `npm start`，再 `npm run test:e2e`（24 项 HTTP 断言）
+- 设备执行页面（运营台，含**履约异议处置台**）：http://localhost:8080/
+- 自动化测试：`npm test`（53 个领域/恢复单测，含 14 个通知投递契约）
+- 端到端场景：先 `npm start`，再 `npm run test:e2e`（43 项 HTTP 断言，含 19 项异议工作流断言）
 
 ## 聚合商通知投递模块（独立服务，`notifier/`）
 
@@ -89,6 +89,35 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 报告裁决等级：`MET`（交付率 ≥ 100%）、`PARTIAL`（≥ 50%）、`MISSED`、`INCONCLUSIVE`（缺口 ≥ 40%）、
 `NO_PARTICIPATION`、`RECALLED`。设备履约：`PERFORMED / UNDERPERFORMED / FAILED / OPT_OUT`。
 
+## 履约异议处置工作流
+
+资源**代理商**可对一份**已封存裁定**（`REPORT_ISSUED` 落链即封存；v1 原始裁定与 v2+ 订正版各自是独立标的）
+提起异议。异议只锚定标的的**编号**（`eventId` + 报告版本 / `reportId`）与**内容指纹**（报告 `hash`）：
+
+| 需求 | 实现 |
+| --- | --- |
+| 截止时刻前提起 | `deadlineMs = report.issuedAt + 24h`（可由 `OBJECTION_WINDOW_MS` 调整），随 `OBJECTION_FILED` 落盘；`now > deadlineMs` 返回 `OBJECTION_DEADLINE_PASSED (409)` |
+| 以编号 + 内容指纹为标的 | 提交 `eventId/reportVersion/reportHash`；指纹与封存裁定不符返回 `FINGERPRINT_MISMATCH (409)`，且不追加任何记录 |
+| 客户请求号重复且正文相同 → 返回原结果 | 每个请求必须带 `requestId`；对规范化正文取 `sha256` 建立索引（受理与补充共用、重启恢复）。同号同正文返回 `idempotent:true` 的**原异议/原材料序号** |
+| 请求号重复但正文不同 → 409 | 同 `requestId` 的正文哈希变化即 `IDEMPOTENCY_CONFLICT (409)`，不区分标的变化 |
+| 同一代理商对同一标的只允许一个待处理实例 | `(aggregatorId, eventId, reportVersion)` 存在 `PENDING` 异议时返回 `DUPLICATE_PENDING_OBJECTION (409)`；审核结案后可再次提起；不同代理商互不影响 |
+| 补充材料只能顺序追加 | 每份材料 `seq = 1,2,…` 只增，终态后追加返回 `OBJECTION_ALREADY_DECIDED (409)`；仅提起方代理商可补料（`NOT_OBJECTION_OWNER 403`） |
+| 审核一经通过/驳回不可再次裁定 | `OBJECTION_REVIEWED` 是终态机：再次审核返回 `OBJECTION_ALREADY_DECIDED (409)`；审核意见必填 |
+| 不得修改被质疑的原始内容 | 异议/补料/审核只新增异议卷宗记录；报告 v1 对象与指纹字节级恒定（有领域单测断言） |
+| 后补计量数据生成新裁定 | 迟到数据产生 v2+ 是**新标的**：旧异议继续锚定 `eventId:v1`（`targetIntact=true`，不自动转移），v2 可被单独提起异议、独立审核 |
+| 重启后状态/时限/材料次序不变 | 全部为只增记录；重放重建异议聚合与请求号索引——PENDING、`deadlineMs`、材料 `seq` 顺序、终态结论均恢复 |
+| 操作页面 | 运营台“履约异议处置台”：提起异议（选已封存裁定、自动带出指纹与截止倒计时）、补充材料、审核（通过/驳回）、查看历史（筛选 待处理/已结案） |
+| 投递服务消息 | 编排日志三类记录桥接为 **受理 `dr.objection.filed` / 补充 `dr.objection.supplemented` / 结论 `dr.objection.decided`** 的 Ed25519 签名信封，`sourceRef=orch:<seq>` 去重，按订阅方保序投递、可独立验签 |
+
+异议状态机：
+
+```
+OBJECTION_FILED ──PENDING
+   │ 顺序追加 OBJECTION_MATERIAL_APPENDED（#1, #2, …；仅提起方、仅 PENDING 期）
+   ▼
+OBJECTION_REVIEWED ── APPROVED / REJECTED（终态：不可再次裁定、不可再补料、不改原报告）
+```
+
 ## HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -102,6 +131,11 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 | POST | `/api/late-history` | 迟到历史日 `{meterId,dayOffset}` |
 | POST | `/api/backfill` | 补传事件窗口内缺失实际读数 `{eventId}` |
 | POST | `/api/meters/offline` | 模拟通信中断/恢复 `{meterId,offline}` |
+| POST | `/api/objections` | 提起异议 `{requestId,eventId,reportVersion,reportHash,aggregatorId,reason}`（同号同正文 200 幂等 / 同号异文 409；新受理 201） |
+| GET | `/api/objections?aggregatorId=&status=&target=` | 异议历史（`target` 形如 `EV_x:v1`） |
+| GET | `/api/objections/:id` | 异议卷宗（标的指纹、截止、材料序列、审核结论） |
+| POST | `/api/objections/:id/materials` | 顺序补充材料 `{requestId,aggregatorId,summary,content}` |
+| POST | `/api/objections/:id/review` | 审核 `{decision:APPROVED|REJECTED,rationale,reviewerId?}`（终态） |
 | POST | `/api/sim/tick` | 推进仿真时钟 `{minutes}` |
 | POST | `/api/sim/reset` | 截断日志并重建种子数据 |
 | GET | `/api/reports/:eventId/versions/:v` | 完整报告（逐区间 + 设备行 + 指纹） |
@@ -120,6 +154,7 @@ DEVICE_CLAIMED · DEVICE_RELEASED
 DEVICE_RECEIPT · RECEIPT_BUFFERED · RECEIPT_DROPPED
 READINGS_BATCH · DAY_READINGS_LOADED · SIM_METER_OFFLINE · SIM_TICK
 BASELINE_CORRECTED · REPORT_ISSUED
+OBJECTION_FILED · OBJECTION_MATERIAL_APPENDED · OBJECTION_REVIEWED
 ```
 
 每条记录：`{seq,ts,type,payload,prevHash,hash}`，
@@ -137,8 +172,9 @@ src/
   seed.js         确定性种子（2 聚合商 / 3 计量点 / 5 设备 / 21 天 15 分钟曲线，含缺失日）
   clock.js        仿真时钟
   util.js         时间区间、规范化 JSON、哈希
-public/           运营台（index.html + app.js，含隔离/残尾恢复横幅）
+public/           运营台（index.html + app.js，含隔离/残尾恢复横幅、履约异议处置台）
 test/kernel.test.js   14 个领域单测（node:test）
+test/objection.test.js 13 个履约异议工作流契约单测（时限/幂等/唯一待处理/顺序材料/终态/新标的/重启恢复）
 test/recovery.test.js 13 个恢复契约单测（残尾/篡改/断链/503 边界/重启续链，含真实 HTTP）
-scripts/e2e.mjs       24 项 HTTP 端到端断言
+scripts/e2e.mjs       43 项 HTTP 端到端断言（含 19 项异议工作流）
 ```

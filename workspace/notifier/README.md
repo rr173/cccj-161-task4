@@ -1,9 +1,9 @@
 # 聚合商通知投递模块（独立服务）
 
-需求响应事件的 **发布 / 撤销 / 开始 / 结束 / 报告订正** 发生时，为每个订阅方生成
-**不可变签名通知信封**，维护**按订阅方独立的持久待发队列**，并提供订阅校验、签名投递、
-确认 API 与投递台页面。模块是一个**独立进程**，只以后向只读方式尾随编排服务的事件日志，
-不向编排内核回写任何东西。
+需求响应事件的 **发布 / 撤销 / 开始 / 结束 / 报告订正** 以及 **履约异议的受理 / 补充材料 / 审核结论**
+发生时，为每个订阅方生成 **不可变签名通知信封**，维护**按订阅方独立的持久待发队列**，
+并提供订阅校验、签名投递、确认 API 与投递台页面。模块是一个**独立进程**，只以后向只读方式尾随
+编排服务的事件日志，不向编排内核回写任何东西。
 
 - 零依赖、纯 Node.js（≥ 20，全局 `fetch`），无数据库、无构建步骤。
 - **只增账本 + SHA-256 哈希链**：信封、入队、租约、送达、失败、死信、重入队、确认、
@@ -16,7 +16,7 @@
 npm run notifier        # 启动投递服务 + 投递台 → http://localhost:8091/
 npm run demo:notifier   # 一键演出全部 7 个故障/恢复场景（真实 HTTP 回环，演完即停）
 npm run test:notifier   # 24 项真实 HTTP 端到端断言
-npm test                # 39 项 node:test 单测（含 12 项通知契约）
+npm test                # 53 项 node:test 单测（含 13 项通知契约）
 ```
 
 ## 核心不变量（需求如何落地）
@@ -37,7 +37,7 @@ npm test                # 39 项 node:test 单测（含 12 项通知契约）
 | 死信后人工重新入队 | 连续失败达上限转 `DELIVERY_DEADLETTERED`（DEAD，阻塞本队列后续）；`POST .../queue/:seq/requeue` 追加 `DLQ_REQUEUED`，attempts 归零、位置不变，恢复保序投递 |
 | 恢复后顺序和签名证据仍可验证 | `GET .../queue/:seq/evidence` 返回信封、验签结论与全链路账本轨迹（ENQUEUED→LEASED→SENT→RECLAIMED→…→DEADLETTERED→REQUEUED→ACKED） |
 
-## 五个通知类型
+## 八个通知类型
 
 | type | 触发（编排日志记录 / 手工 API） |
 | --- | --- |
@@ -46,6 +46,13 @@ npm test                # 39 项 node:test 单测（含 12 项通知契约）
 | `dr.event.started` | `EVENT_ACTIVATED`（时窗开始、基线冻结） |
 | `dr.event.ended` | `EVENT_CLOSED` |
 | `dr.event.report.corrected` | `REPORT_ISSUED` 且 `version > 1`（订正报告；v1 原始裁决不重复打扰） |
+| `dr.objection.filed` | `OBJECTION_FILED`（履约异议受理；detail 含标的编号 `target`、内容指纹 `reportHash`、代理商、截止 `deadlineMs`） |
+| `dr.objection.supplemented` | `OBJECTION_MATERIAL_APPENDED`（补充材料顺序追加；detail 含 `materialSeq`） |
+| `dr.objection.decided` | `OBJECTION_REVIEWED`（审核通过/驳回结论；detail 含 `decision` 与 `target`） |
+
+异议三类消息与事件类一样生成**可验签且去重**的信封：尾随编排日志时以 `sourceRef=orch:<seq>`
+幂等，重复尾随（位置丢失/重启）绝不重复入队；订阅方可用 `dr.objection.*` 主题只订阅异议消息，
+`dr.event.*` 只订阅事件消息。旧异议在订正报告产生后仍锚定原标的，因此不会自动“转移”通知。
 
 事件接入用稳定 `sourceRef` 去重：尾随编排日志时为 `orch:<orchestratorSeq>`，
 **尾随位置丢失、重启、与手工 API 并发都安全**——同一 sourceRef 永远返回同一信封，不重复入队。

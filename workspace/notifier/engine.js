@@ -22,6 +22,9 @@ export const NOTIFY_TYPES = Object.freeze({
   STARTED: 'dr.event.started',
   ENDED: 'dr.event.ended',
   REPORT_CORRECTED: 'dr.event.report.corrected',
+  OBJECTION_FILED: 'dr.objection.filed',
+  OBJECTION_SUPPLEMENTED: 'dr.objection.supplemented',
+  OBJECTION_DECIDED: 'dr.objection.decided',
 });
 
 export const ITEM_STATUS = Object.freeze({
@@ -674,11 +677,11 @@ function normalizeTopics(topics) {
   return clean;
 }
 
-// 主题匹配：'*' 全量；'dr.event.*' 前缀通配；否则精确匹配。
+// 主题匹配：'*' 全量；'dr.event.*'/'dr.objection.*' 等前缀通配；否则精确匹配。
 function topicMatches(subscribed, type, detail) {
   void detail;
   return subscribed.some((t) => {
-    if (t === '*' || t === 'dr.event.*') return true;
+    if (t === '*') return true;
     if (t.endsWith('.*')) return type.startsWith(t.slice(0, -1));
     return t === type;
   });
