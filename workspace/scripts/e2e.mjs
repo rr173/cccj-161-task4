@@ -133,6 +133,53 @@ function check(name, cond, extra = '') {
   const vf = await api(`/api/reports/${id}/versions/2/verify`, null, 'GET');
   check('v2 报告可独立重算指纹', vf.bodyHashMatches);
 
+  console.log('场景 I：履约异议处置（受理/幂等/唯一待处理/材料顺序/审核终态）');
+  const v1Rep = await api(`/api/reports/${id}/versions/1`, null, 'GET');
+  const dspBody = { requestId: 'REQ-E2E-1', aggregatorId: 'AGG-A', reportId: v1Rep.reportId, reportHash: v1Rep.hash, reason: '交付率认定存疑' };
+  const filed = await api('/api/disputes', dspBody);
+  check('异议受理为待处理，时限=签发后48h', filed.dispute.status === 'PENDING' &&
+    filed.dispute.deadline === v1Rep.issuedAt + 48 * 3600 * 1000, filed.dispute.disputeId);
+  const dspId = filed.dispute.disputeId;
+  const dupFile = await api('/api/disputes', dspBody);
+  check('同请求号同正文返回原结果', dupFile.idempotent === true && dupFile.dispute.disputeId === dspId);
+  let reqConflict;
+  try { await api('/api/disputes', { ...dspBody, reason: '改动正文' }); } catch (e) { reqConflict = e; }
+  check('同请求号不同正文返回 409', reqConflict?.code === 'REQUEST_ID_CONFLICT' && reqConflict?.status === 409, reqConflict?.code);
+  let pending2;
+  try { await api('/api/disputes', { ...dspBody, requestId: 'REQ-E2E-2' }); } catch (e) { pending2 = e; }
+  check('同一代理商同一标的仅一个待处理', pending2?.code === 'DISPUTE_PENDING_EXISTS', pending2?.code);
+  let hashBad;
+  try { await api('/api/disputes', { ...dspBody, requestId: 'REQ-E2E-3', reportHash: '0'.repeat(64) }); } catch (e) { hashBad = e; }
+  check('标的指纹不符被拒', hashBad?.code === 'REPORT_HASH_MISMATCH', hashBad?.code);
+
+  const sup1 = await api(`/api/disputes/${dspId}/supplements`, { requestId: 'REQ-E2E-S1', aggregatorId: 'AGG-A', note: '电表原始脉冲记录' });
+  const sup2 = await api(`/api/disputes/${dspId}/supplements`, { requestId: 'REQ-E2E-S2', aggregatorId: 'AGG-A', note: '现场运行日志' });
+  check('材料顺序追加序号单调', sup1.material.seq === 1 && sup2.material.seq === 2);
+  let seqBad;
+  try { await api(`/api/disputes/${dspId}/supplements`, { requestId: 'REQ-E2E-S3', aggregatorId: 'AGG-A', note: '跳序', materialSeq: 9 }); }
+  catch (e) { seqBad = e; }
+  check('材料跳序被拒', seqBad?.code === 'MATERIAL_SEQ_CONFLICT', seqBad?.code);
+  const detail = await api(`/api/disputes/${dspId}`, null, 'GET');
+  check('工单历史含受理与两次补充', detail.history.map((h) => h.type).join(',') === 'FILED,SUPPLEMENTED,SUPPLEMENTED' &&
+    detail.materials.map((m) => m.seq).join(',') === '1,2');
+
+  const resolved = await api(`/api/disputes/${dspId}/resolution`, { requestId: 'REQ-E2E-R1', outcome: 'UPHELD', comment: '复核后维持原裁定，异议记录在案' });
+  check('审核通过进入终态', resolved.dispute.status === 'UPHELD' && resolved.dispute.resolution.outcome === 'UPHELD');
+  let reResolve;
+  try { await api(`/api/disputes/${dspId}/resolution`, { requestId: 'REQ-E2E-R2', outcome: 'REJECTED' }); } catch (e) { reResolve = e; }
+  check('终态后不可再次裁定', reResolve?.code === 'DISPUTE_TERMINAL', reResolve?.code);
+  let supLate;
+  try { await api(`/api/disputes/${dspId}/supplements`, { requestId: 'REQ-E2E-S4', aggregatorId: 'AGG-A', note: '终态后补充' }); }
+  catch (e) { supLate = e; }
+  check('终态后不可再补充材料', supLate?.code === 'DISPUTE_TERMINAL', supLate?.code);
+
+  const v1AfterDispute = await api(`/api/reports/${id}/versions/1`, null, 'GET');
+  check('被质疑的原始裁定内容不变', v1AfterDispute.hash === v1Hash);
+  const stFinal = await api('/api/state', null, 'GET');
+  check('state 暴露异议工单', stFinal.disputes.some((d) => d.disputeId === dspId && d.status === 'UPHELD'));
+  const chainFinal = await api('/api/chain/verify', null, 'GET');
+  check('异议流程后哈希链仍完整', chainFinal.ok, `length=${chainFinal.length}`);
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('E2E 异常', e); process.exit(1); });

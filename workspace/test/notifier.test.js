@@ -45,7 +45,7 @@ let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ntf-')); });
 test.afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-test('五类通知都能生成不可变信封并按主题入队', async () => {
+test('全部通知类型都能生成不可变信封并按主题入队', async () => {
   const { eng, load } = freshEngine(join(dir, 'n.log'));
   await load();
   const c1 = eng.createSubscriber({ subscriberId: 'all', callbackUrl: 'http://127.0.0.1:9/x/callback' });
@@ -61,7 +61,7 @@ test('五类通知都能生成不可变信封并按主题入队', async () => {
     assert.equal(r.deduplicated, false);
     assert.equal(r.envelopeSeq, seq);
   }
-  assert.equal(eng.subscriberView('all').queue.length, 5);
+  assert.equal(eng.subscriberView('all').queue.length, Object.keys(NOTIFY_TYPES).length);
   const onlyPub = eng.subscriberView('only-pub').queue;
   assert.equal(onlyPub.length, 1);
   assert.equal(onlyPub[0].envelopeSeq, 1);

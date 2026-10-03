@@ -51,6 +51,9 @@
   .tag.PARTIAL,.tag.UNDERPERFORMED,.tag.INCONCLUSIVE { background:#3d2f10; color:#f5c451; }
   .tag.MISSED,.tag.FAILED { background:#3f1d1d; color:#ff9d9d; }
   .tag.RECALLED { background:#3f1d1d; color:#ff9d9d; }
+  .tag.PENDING { background:#13315c; color:#8fc2ff; }
+  .tag.UPHELD { background:#0f3a2a; color:#5fe3ac; }
+  .tag.REJECTED { background:#3f1d1d; color:#ff9d9d; }
   .muted { color:var(--muted); font-size:12px; }
   .mono { font-variant-numeric:tabular-nums; font-family:ui-monospace,Menlo,Consolas,monospace; }
   table { width:100%; border-collapse:collapse; font-size:12.5px; }
@@ -173,6 +176,34 @@
       <pre class="log" id="miniLog">（点击“校验/日志”加载）</pre>
       <button class="ghost" onclick="loadLog()">刷新裁决日志</button>
     </div>
+  </div>
+</div>
+
+<!-- 履约异议处置工作流 -->
+<div class="wrap" style="grid-template-columns:380px 1fr">
+  <div class="panel">
+    <h2>④ 提起履约异议（资源代理商）</h2>
+    <label>聚合商</label>
+    <select id="dspAgg"></select>
+    <label>标的裁定（已封存：编号 + 内容指纹）</label>
+    <select id="dspTarget"></select>
+    <label>异议事由</label>
+    <textarea id="dspReason" rows="3" placeholder="说明对裁定结果的异议理由…"></textarea>
+    <label>客户请求号（幂等键）</label>
+    <div class="row" style="flex-wrap:nowrap">
+      <input id="dspReqId" class="mono">
+      <button class="ghost" onclick="mintReqId()" title="生成新请求号">↻ 新请求号</button>
+    </div>
+    <div class="muted" style="margin-top:4px">同一请求号 + 相同正文重复提交返回原结果；同一请求号 + 不同正文返回 409。</div>
+    <div style="margin-top:10px"><button class="primary" onclick="fileDispute()">提交异议</button></div>
+    <div class="muted" style="margin-top:6px">
+      截止时刻 = 裁定签发后 48 仿真小时；同一代理商对同一标的只允许一个待处理异议；
+      后补计量数据产生新裁定时，旧异议仍锚定原标的，新标的可单独受理。
+    </div>
+  </div>
+  <div class="panel">
+    <h2>异议工单（补充材料 / 审核 / 历史）</h2>
+    <div id="disputes" class="muted">尚无异议工单。</div>
   </div>
 </div>
 

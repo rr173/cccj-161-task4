@@ -31,6 +31,7 @@ function toast(msg, kind = '') {
 const errToast = (e) => toast(`<b>${e.code || '错误'}</b>：${e.message}`, 'err');
 
 const fmtTs = (ms) => new Date(ms).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+const esc = (s) => String(s ?? '').replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
 
 async function refresh() {
   try {
@@ -47,6 +48,8 @@ function render() {
   renderDetail();
   renderReports();
   renderChain();
+  renderDisputeForm();
+  renderDisputes();
   if (!$('evMeter').dataset.filled) {
     $('evMeter').innerHTML = STATE.meters.map((m) => `<option value="${m.id}">${m.id} · ${m.name}</option>`).join('');
     $('evMeter').dataset.filled = '1';
@@ -431,6 +434,123 @@ async function loadLog() {
   $('miniLog').textContent = r.records.slice().reverse().map((x) =>
     `#${String(x.seq).padStart(3, '0')} ${new Date(x.ts || 0).toISOString().slice(11, 16)} ${x.type.padEnd(20)} ${JSON.stringify(x.payload).slice(0, 90)}`
   ).join('\n');
+}
+
+// ---------- 履约异议处置 ----------
+
+function mintReqId() {
+  $('dspReqId').value = `REQ-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
+
+function disputeTargets() {
+  const out = [];
+  for (const ev of STATE.events) {
+    for (const r of ev.reports) out.push({ eventId: ev.id, ...r });
+  }
+  return out;
+}
+
+function renderDisputeForm() {
+  if (!$('dspAgg').dataset.filled) {
+    $('dspAgg').innerHTML = STATE.aggregators.map((a) => `<option value="${a.id}">${a.id} · ${a.name}</option>`).join('');
+    $('dspAgg').dataset.filled = '1';
+    mintReqId();
+  }
+  const sel = $('dspTarget');
+  const prev = sel.value;
+  const targets = disputeTargets();
+  sel.innerHTML = targets.length
+    ? targets.map((r) => `<option value="${r.reportId}|${r.hash}">${r.reportId} · ${r.verdict} · 指纹 ${r.hash.slice(0, 12)}…</option>`).join('')
+    : '<option value="">（尚无已封存裁定）</option>';
+  if (targets.some((r) => `${r.reportId}|${r.hash}` === prev)) sel.value = prev;
+}
+
+async function fileDispute() {
+  const [reportId, reportHash] = ($('dspTarget').value || '').split('|');
+  if (!reportId) return toast('尚无已封存裁定可提异议', 'err');
+  try {
+    const r = await api('/api/disputes', {
+      requestId: $('dspReqId').value.trim(),
+      aggregatorId: $('dspAgg').value,
+      reportId,
+      reportHash,
+      reason: $('dspReason').value,
+    });
+    toast(r.idempotent
+      ? `请求号重复：返回原受理结果 <b>${r.dispute.disputeId}</b>（未新增记录）`
+      : `异议 <b>${r.dispute.disputeId}</b> 已受理，截止 ${fmtTs(r.dispute.deadline)}`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+function renderDisputes() {
+  const list = [...(STATE.disputes || [])].sort((a, b) => b.filedAt - a.filedAt);
+  if (!list.length) { $('disputes').className = 'muted'; $('disputes').textContent = '尚无异议工单。'; return; }
+  $('disputes').className = '';
+  $('disputes').innerHTML = list.map((d) => {
+    const remainMin = Math.floor((d.deadline - STATE.now) / 60000);
+    const statusTxt = d.status === 'PENDING' ? '待处理' : d.status === 'UPHELD' ? '已通过' : '已驳回';
+    return `<div class="card">
+      <div class="row" style="justify-content:space-between">
+        <b>${d.disputeId}</b> <span class="tag ${d.status}">${statusTxt}</span>
+      </div>
+      <div class="muted mono" style="margin:4px 0">
+        ${d.aggregatorId} → 标的 ${d.reportId}<br>
+        标的指纹 ${d.reportHash.slice(0, 16)}…<br>
+        受理 ${fmtTs(d.filedAt)} · 截止 ${fmtTs(d.deadline)}${d.status === 'PENDING' ? `（剩 ${remainMin} 分钟）` : ''}
+      </div>
+      <div class="muted">事由：${esc(d.reason)}</div>
+      ${d.materials.length ? `<h3>补充材料（${d.materials.length} 份，顺序追加）</h3>
+        ${d.materials.map((m) => `<div class="muted mono">#${m.seq} [${esc(m.kind)}] ${esc(m.note)} <span class="muted">${fmtTs(m.at)}</span></div>`).join('')}` : ''}
+      ${d.resolution ? `<div class="report ${d.resolution.outcome === 'UPHELD' ? 'v1' : ''}" style="margin-top:6px">
+        <b>${d.resolution.outcome === 'UPHELD' ? '审核通过' : '审核驳回'}</b>
+        <span class="muted">${esc(d.resolution.resolvedBy)} · ${fmtTs(d.resolution.resolvedAt)}</span>
+        ${d.resolution.comment ? `<br><span class="muted">${esc(d.resolution.comment)}</span>` : ''}
+      </div>` : ''}
+      ${d.status === 'PENDING' ? `
+        <div class="row" style="margin-top:6px;flex-wrap:nowrap">
+          <input id="sup-note-${d.disputeId}" placeholder="补充材料说明（顺序追加）" style="flex:1">
+          <button class="ghost" onclick="supplement('${d.disputeId}')">追加材料</button>
+        </div>
+        <div class="btns" style="margin-top:4px">
+          <button class="good" onclick="resolveDispute('${d.disputeId}','UPHELD')">审核通过</button>
+          <button class="bad" onclick="resolveDispute('${d.disputeId}','REJECTED')">驳回</button>
+        </div>` : ''}
+      <details><summary>历史（${d.history.length}）</summary>
+        ${d.history.map((h) => `<div class="muted mono">${fmtTs(h.at)} ${h.type}${h.materialSeq ? ' #' + h.materialSeq : ''}${h.outcome ? ' → ' + h.outcome : ''} <span class="muted">记录#${h.recordSeq}</span></div>`).join('')}
+      </details>
+    </div>`;
+  }).join('');
+}
+
+async function supplement(disputeId) {
+  const d = (STATE.disputes || []).find((x) => x.disputeId === disputeId);
+  if (!d) return;
+  try {
+    const r = await api(`/api/disputes/${encodeURIComponent(disputeId)}/supplements`, {
+      requestId: `REQ-SUP-${disputeId}-${d.materials.length + 1}-${Date.now().toString(36)}`,
+      aggregatorId: d.aggregatorId,
+      kind: 'EVIDENCE',
+      note: $(`sup-note-${disputeId}`).value,
+    });
+    toast(r.idempotent ? '请求号重复：返回原受理结果' : `材料 #${r.material.seq} 已顺序追加`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function resolveDispute(disputeId, outcome) {
+  const comment = prompt(outcome === 'UPHELD' ? '审核通过意见（可选）' : '驳回理由（可选）');
+  if (comment === null) return;
+  try {
+    await api(`/api/disputes/${encodeURIComponent(disputeId)}/resolution`, {
+      requestId: `REQ-RES-${disputeId}-${Date.now().toString(36)}`,
+      outcome,
+      comment,
+      resolvedBy: '运营方',
+    });
+    toast(`异议 ${disputeId} 已${outcome === 'UPHELD' ? '通过' : '驳回'}（终态，不可再裁定；原裁定内容不变）`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
 }
 
 refresh();

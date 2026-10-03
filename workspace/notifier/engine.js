@@ -22,6 +22,9 @@ export const NOTIFY_TYPES = Object.freeze({
   STARTED: 'dr.event.started',
   ENDED: 'dr.event.ended',
   REPORT_CORRECTED: 'dr.event.report.corrected',
+  DISPUTE_ACCEPTED: 'dr.dispute.accepted',
+  DISPUTE_SUPPLEMENTED: 'dr.dispute.supplemented',
+  DISPUTE_RESOLVED: 'dr.dispute.resolved',
 });
 
 export const ITEM_STATUS = Object.freeze({

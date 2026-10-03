@@ -16,8 +16,8 @@ npm start                 # http://localhost:8080
 ```
 
 - 设备执行页面（运营台）：http://localhost:8080/
-- 自动化测试：`npm test`（39 个领域/恢复单测，含 12 个通知投递契约）
-- 端到端场景：先 `npm start`，再 `npm run test:e2e`（24 项 HTTP 断言）
+- 自动化测试：`npm test`（50 个领域/恢复单测，含 12 个通知投递契约、11 个履约异议契约）
+- 端到端场景：先 `npm start`，再 `npm run test:e2e`（38 项 HTTP 断言）
 
 ## 聚合商通知投递模块（独立服务，`notifier/`）
 
@@ -35,6 +35,27 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 
 该服务只读尾随 `data/events.log`（`sourceRef=orch:<seq>` 幂等），不回写编排内核；
 详见 [`notifier/README.md`](notifier/README.md)。
+
+## 履约异议处置工作流
+
+资源代理商对已封存裁定（报告版本）提起异议，全程事件溯源，原裁定内容永不改写：
+
+- **受理**：代理商须在**截止时刻**（裁定签发后 48 仿真小时）前，以裁定的 **编号 + 内容指纹** 为标的提交异议；
+  指纹与封存裁定不符即拒（`REPORT_HASH_MISMATCH`），超期即拒（`DISPUTE_DEADLINE_PASSED`）。
+- **客户请求号幂等**：`requestId` 必填。同一请求号 + 相同正文 → 返回原受理结果（不新增记录）；
+  同一请求号 + 不同正文 → `409 REQUEST_ID_CONFLICT`。受理/补充/审核三个命令均遵守。
+- **唯一待处理**：同一代理商对同一标的只允许一个 `PENDING` 实例（`DISPUTE_PENDING_EXISTS`）；
+  审核终结后可对该标的再提新实例。
+- **补充材料只能顺序追加**：`materialSeq` 单调递增（显式跳序 `MATERIAL_SEQ_CONFLICT`），
+  仅提起方本人可补（`DISPUTE_OWNER_MISMATCH`），终态后不可再补。
+- **审核终态**：`UPHELD`（通过）/ `REJECTED`（驳回）一经作出不可再次裁定（`DISPUTE_TERMINAL`）；
+  审核只形成结论记录，**被质疑的原始裁定字节级不变**。
+- **后补计量数据**：迟到数据产生新裁定版本时，旧异议继续锚定原标的（编号+指纹），**不自动转移**；
+  新版本作为新标的可单独受理，两类待处理并存。
+- **重启恢复**：待处理状态、截止时限、材料次序全部由链上记录重放重建，重启前后完全一致。
+- **投递通知**：受理 / 补充 / 结论分别映射为 `dr.dispute.accepted / .supplemented / .resolved`，
+  由投递服务生成 Ed25519 签名信封并按 `orch:<seq>` 去重。
+- 运营台底部“④ 提起履约异议 / 异议工单”面板支持：提起异议、补充材料、审核通过/驳回、查看历史时间线。
 
 
 ## 重启恢复契约（日志损坏 / 断电残尾）
@@ -72,6 +93,9 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
    - **v1 字节级不变**（UI 中指纹前后一致，接口 `/api/reports/:id/versions/1` 哈希恒定）。
 9. **补传选中事件窗口内缺失的实际读数**（通信恢复后的电表补传）：有缺口才产生新订正版；无新证据不产生新版本。
 10. **验证事件链 + 报告指纹**：重新计算整条哈希链与每份报告的内容指纹。
+11. 底部 **④ 履约异议**：选择聚合商与已封存裁定（编号+指纹），填写事由提交；
+    同一请求号重复提交演示幂等，改动正文再提交得到 409；在工单卡片上顺序追加材料、
+    审核通过/驳回（终态），展开“历史”查看完整时间线。
 
 ## 关键不变量（如何落地需求）
 
@@ -85,6 +109,9 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 | 回执乱序 | 每设备单调 `clientSeq` 水位；超前缓冲、缺口自动排水、过期拒绝（`STALE_SEQ`/`PHASE_CONFLICT`），状态机禁止非法跃迁 |
 | 通信中断 | 表计离线期间无读数 → 区间缺口；裁决按缺口比例给 `INCONCLUSIVE`；恢复后补传只产生订正版 |
 | 可验证的削减报告 | 报告含逐区间基线/实际/削减、设备履约行、裁决等级与 **内容指纹**；链上锚定，`/verify` 可独立重算 |
+| 异议标的锚定 | 异议记录裁定的 `reportId`+`reportHash`；指纹不符/超截止时刻/同标的重复待处理均被拒 |
+| 异议请求号幂等 | `requestId`+正文哈希入链；同号同文返回原结果，同号不同文 409；重启后台账不丢 |
+| 异议材料与审核 | 材料 `materialSeq` 顺序追加；`UPHELD`/`REJECTED` 终态不可再裁定；原裁定内容永不改写 |
 
 报告裁决等级：`MET`（交付率 ≥ 100%）、`PARTIAL`（≥ 50%）、`MISSED`、`INCONCLUSIVE`（缺口 ≥ 40%）、
 `NO_PARTICIPATION`、`RECALLED`。设备履约：`PERFORMED / UNDERPERFORMED / FAILED / OPT_OUT`。
@@ -104,6 +131,11 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 | POST | `/api/meters/offline` | 模拟通信中断/恢复 `{meterId,offline}` |
 | POST | `/api/sim/tick` | 推进仿真时钟 `{minutes}` |
 | POST | `/api/sim/reset` | 截断日志并重建种子数据 |
+| POST | `/api/disputes` | 提起异议 `{requestId,aggregatorId,reportId,reportHash,reason}`（幂等重放返回 200，新受理 201） |
+| GET | `/api/disputes?status=&aggregatorId=` | 异议工单列表 |
+| GET | `/api/disputes/:id` | 工单详情（材料次序 + 历史时间线） |
+| POST | `/api/disputes/:id/supplements` | 顺序补充材料 `{requestId,aggregatorId,note,kind?,materialSeq?}` |
+| POST | `/api/disputes/:id/resolution` | 审核 `{requestId,outcome:UPHELD\|REJECTED,comment?,resolvedBy?}` |
 | GET | `/api/reports/:eventId/versions/:v` | 完整报告（逐区间 + 设备行 + 指纹） |
 | GET | `/api/reports/:eventId/versions/:v/verify` | 独立重算报告指纹 |
 | GET | `/api/chain/verify` | 哈希链 + 全部报告指纹校验 |
@@ -120,6 +152,7 @@ DEVICE_CLAIMED · DEVICE_RELEASED
 DEVICE_RECEIPT · RECEIPT_BUFFERED · RECEIPT_DROPPED
 READINGS_BATCH · DAY_READINGS_LOADED · SIM_METER_OFFLINE · SIM_TICK
 BASELINE_CORRECTED · REPORT_ISSUED
+DISPUTE_FILED · DISPUTE_SUPPLEMENTED · DISPUTE_RESOLVED
 ```
 
 每条记录：`{seq,ts,type,payload,prevHash,hash}`，
@@ -137,8 +170,9 @@ src/
   seed.js         确定性种子（2 聚合商 / 3 计量点 / 5 设备 / 21 天 15 分钟曲线，含缺失日）
   clock.js        仿真时钟
   util.js         时间区间、规范化 JSON、哈希
-public/           运营台（index.html + app.js，含隔离/残尾恢复横幅）
+public/           运营台（index.html + app.js，含隔离/残尾恢复横幅、履约异议面板）
 test/kernel.test.js   14 个领域单测（node:test）
+test/dispute.test.js  11 个履约异议单测（受理/幂等/材料顺序/终态/重启/投递映射）
 test/recovery.test.js 13 个恢复契约单测（残尾/篡改/断链/503 边界/重启续链，含真实 HTTP）
-scripts/e2e.mjs       24 项 HTTP 端到端断言
+scripts/e2e.mjs       38 项 HTTP 端到端断言
 ```

@@ -37,7 +37,7 @@ npm test                # 39 项 node:test 单测（含 12 项通知契约）
 | 死信后人工重新入队 | 连续失败达上限转 `DELIVERY_DEADLETTERED`（DEAD，阻塞本队列后续）；`POST .../queue/:seq/requeue` 追加 `DLQ_REQUEUED`，attempts 归零、位置不变，恢复保序投递 |
 | 恢复后顺序和签名证据仍可验证 | `GET .../queue/:seq/evidence` 返回信封、验签结论与全链路账本轨迹（ENQUEUED→LEASED→SENT→RECLAIMED→…→DEADLETTERED→REQUEUED→ACKED） |
 
-## 五个通知类型
+## 八个通知类型
 
 | type | 触发（编排日志记录 / 手工 API） |
 | --- | --- |
@@ -46,6 +46,9 @@ npm test                # 39 项 node:test 单测（含 12 项通知契约）
 | `dr.event.started` | `EVENT_ACTIVATED`（时窗开始、基线冻结） |
 | `dr.event.ended` | `EVENT_CLOSED` |
 | `dr.event.report.corrected` | `REPORT_ISSUED` 且 `version > 1`（订正报告；v1 原始裁决不重复打扰） |
+| `dr.dispute.accepted` | `DISPUTE_FILED`（履约异议受理，detail 含 disputeId/标的指纹/截止时刻） |
+| `dr.dispute.supplemented` | `DISPUTE_SUPPLEMENTED`（补充材料，detail 含 materialSeq） |
+| `dr.dispute.resolved` | `DISPUTE_RESOLVED`（审核结论，detail 含 outcome） |
 
 事件接入用稳定 `sourceRef` 去重：尾随编排日志时为 `orch:<orchestratorSeq>`，
 **尾随位置丢失、重启、与手工 API 并发都安全**——同一 sourceRef 永远返回同一信封，不重复入队。

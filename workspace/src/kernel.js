@@ -8,12 +8,14 @@ import { EventStore, LogQuarantineError } from './store.js';
 import {
   INTERVAL_MS,
   INTERVALS_PER_DAY,
+  canonicalJSON,
   dayKey,
   floorInterval,
   intervalIndex,
   intervalStarts,
   iso,
   round3,
+  sha256Hex,
   uid,
 } from './util.js';
 
@@ -27,6 +29,11 @@ export class DomainError extends Error {
 
 const RECEIPT_STATUSES = ['ACCEPTED', 'DECLINED', 'EXECUTING', 'RECOVERED'];
 const EVENT_TERMINAL = new Set(['RECALLED', 'CLOSED']);
+
+// 履约异议：裁定（报告）封存后 48 个仿真小时内可提异议；时限随 DISPUTE_FILED 记录落盘，
+// 重启重放后不变。审核结论 UPHELD（通过）/ REJECTED（驳回）为终态。
+export const DISPUTE_WINDOW_MS = 48 * 3600 * 1000;
+export const DISPUTE_OUTCOMES = ['UPHELD', 'REJECTED'];
 
 // 事件窗口内真实出力（仿真）：基线画像减去执行设备的削减量
 function simIntervalActual(meterIdx, ts, totalShedKw) {
@@ -84,6 +91,8 @@ export class Kernel {
       reports: new Map(), // eventId -> [reports]
       sheds: new Map(), // deviceId -> Map(ts -> kw)
       offline: new Set(),
+      disputes: new Map(), // disputeId -> 异议工单投影（待处理状态/时限/材料次序全部由记录重建）
+      requests: new Map(), // requestId -> {op, bodyHash, disputeId, materialSeq?}（客户请求号幂等台账）
       genCursor: floorInterval(BASE_NOW),
     };
     this.clock = new Clock(BASE_NOW);
@@ -246,6 +255,44 @@ export class Kernel {
       case 'REPORT_ISSUED':
         s.reports.get(p.report.eventId)?.push(p.report);
         break;
+      case 'DISPUTE_FILED':
+        s.disputes.set(p.disputeId, {
+          disputeId: p.disputeId,
+          aggregatorId: p.aggregatorId,
+          eventId: p.eventId,
+          reportId: p.reportId,
+          reportVersion: p.reportVersion,
+          reportHash: p.reportHash,
+          reason: p.reason,
+          status: 'PENDING',
+          filedAt: p.filedAt,
+          deadline: p.deadline,
+          materials: [],
+          resolution: null,
+          history: [{ type: 'FILED', at: p.filedAt, recordSeq: rec.seq }],
+        });
+        s.requests.set(p.requestId, { op: rec.type, bodyHash: p.bodyHash, disputeId: p.disputeId });
+        break;
+      case 'DISPUTE_SUPPLEMENTED': {
+        const d = s.disputes.get(p.disputeId);
+        if (d) {
+          // 材料只增且序号单调：重放顺序即材料次序，重启后不变
+          d.materials.push({ seq: p.materialSeq, kind: p.material.kind, note: p.material.note, ref: p.material.ref ?? null, at: p.at });
+          d.history.push({ type: 'SUPPLEMENTED', at: p.at, materialSeq: p.materialSeq, recordSeq: rec.seq });
+        }
+        s.requests.set(p.requestId, { op: rec.type, bodyHash: p.bodyHash, disputeId: p.disputeId, materialSeq: p.materialSeq });
+        break;
+      }
+      case 'DISPUTE_RESOLVED': {
+        const d = s.disputes.get(p.disputeId);
+        if (d) {
+          d.status = p.outcome; // UPHELD / REJECTED，终态
+          d.resolution = { outcome: p.outcome, comment: p.comment ?? null, resolvedBy: p.resolvedBy, resolvedAt: p.resolvedAt };
+          d.history.push({ type: 'RESOLVED', at: p.resolvedAt, outcome: p.outcome, recordSeq: rec.seq });
+        }
+        s.requests.set(p.requestId, { op: rec.type, bodyHash: p.bodyHash, disputeId: p.disputeId });
+        break;
+      }
       default:
         break;
     }
@@ -293,6 +340,12 @@ export class Kernel {
         return this.backfillActuals(cmd, now);
       case 'SET_METER_OFFLINE':
         return this.setMeterOffline(cmd, now);
+      case 'FILE_DISPUTE':
+        return this.fileDispute(cmd, now);
+      case 'SUPPLEMENT_DISPUTE':
+        return this.supplementDispute(cmd, now);
+      case 'RESOLVE_DISPUTE':
+        return this.resolveDispute(cmd, now);
       case 'TICK':
         return this.tick(cmd.minutes ?? 15, now);
       case 'RESET':
@@ -799,6 +852,190 @@ export class Kernel {
     return { meterId: cmd.meterId, offline };
   }
 
+  // ---------- 履约异议处置 ----------
+
+  // 客户请求号幂等闸：同号同文 -> 返回已受理结果（不重复追加记录）；
+  // 同号不同文 -> 409。台账由链上记录（requestId+bodyHash）重放重建，重启后语义不变。
+  #requestGate(cmd) {
+    const requestId = cmd.requestId;
+    if (typeof requestId !== 'string' || !requestId.trim()) {
+      throw new DomainError('BAD_REQUEST', '客户请求号 requestId 必填（作为幂等键）');
+    }
+    const bodyHash = sha256Hex(canonicalJSON(cmd));
+    const seen = this.s.requests.get(requestId);
+    if (seen && seen.bodyHash !== bodyHash) {
+      throw new DomainError('REQUEST_ID_CONFLICT', '客户请求号已被不同正文使用（幂等冲突）', { requestId });
+    }
+    return { bodyHash, seen: seen || null };
+  }
+
+  #requireDispute(disputeId) {
+    const d = this.s.disputes.get(disputeId);
+    if (!d) throw new DomainError('DISPUTE_NOT_FOUND', `异议 ${disputeId} 不存在`, { disputeId });
+    return d;
+  }
+
+  // 提起异议：代理商在截止时刻前，以“已封存裁定的编号 + 内容指纹”为标的提交。
+  fileDispute(cmd, now) {
+    const gate = this.#requestGate(cmd);
+    if (gate.seen) {
+      return { dispute: this.disputeView(gate.seen.disputeId), idempotent: true };
+    }
+    const aggregatorId = String(cmd.aggregatorId || '');
+    if (!this.s.aggregators.has(aggregatorId)) {
+      throw new DomainError('NOT_FOUND', `聚合商 ${aggregatorId} 不存在`);
+    }
+    // 标的必须是一份已封存裁定（已签发的报告版本）
+    const report = [...this.s.reports.values()].flat().find((r) => r.reportId === cmd.reportId);
+    if (!report) {
+      throw new DomainError('REPORT_NOT_FOUND', `裁定 ${cmd.reportId} 不存在（尚未封存）`, { reportId: cmd.reportId });
+    }
+    if (cmd.reportHash !== report.hash) {
+      throw new DomainError('REPORT_HASH_MISMATCH', '标的指纹与封存裁定的内容指纹不符', {
+        reportId: report.reportId,
+        expected: report.hash,
+        provided: cmd.reportHash ?? null,
+      });
+    }
+    const deadline = report.issuedAt + DISPUTE_WINDOW_MS;
+    if (now > deadline) {
+      throw new DomainError('DISPUTE_DEADLINE_PASSED', '已超过该裁定的异议截止时刻', {
+        reportId: report.reportId, deadline, deadlineIso: iso(deadline),
+      });
+    }
+    // 同一代理商对同一标的只允许一个待处理实例
+    for (const d of this.s.disputes.values()) {
+      if (d.status === 'PENDING' && d.aggregatorId === aggregatorId && d.reportId === report.reportId) {
+        throw new DomainError('DISPUTE_PENDING_EXISTS', '同一代理商对同一标的只允许一个待处理异议', {
+          pendingDisputeId: d.disputeId,
+        });
+      }
+    }
+    const reason = String(cmd.reason || '').trim();
+    if (!reason) throw new DomainError('BAD_REQUEST', '异议事由 reason 必填');
+
+    const disputeId = uid('DSP');
+    const payload = {
+      disputeId,
+      requestId: cmd.requestId,
+      bodyHash: gate.bodyHash,
+      aggregatorId,
+      eventId: report.eventId,
+      reportId: report.reportId,
+      reportVersion: report.version,
+      reportHash: report.hash,
+      reason,
+      filedAt: now,
+      deadline,
+    };
+    this.store.append('DISPUTE_FILED', payload, now);
+    this.apply(this.store.all().at(-1));
+    return { dispute: this.disputeView(disputeId), idempotent: false };
+  }
+
+  // 补充材料：只能向待处理异议顺序追加（materialSeq 单调递增，不允许插序/改写）。
+  supplementDispute(cmd, now) {
+    const gate = this.#requestGate(cmd);
+    if (gate.seen) {
+      const view = this.disputeView(gate.seen.disputeId);
+      return {
+        dispute: view,
+        material: view.materials.find((m) => m.seq === gate.seen.materialSeq) ?? null,
+        idempotent: true,
+      };
+    }
+    const d = this.#requireDispute(cmd.disputeId);
+    if (d.status !== 'PENDING') {
+      throw new DomainError('DISPUTE_TERMINAL', '异议已有审核结论（终态），不可再补充材料', { status: d.status });
+    }
+    if (String(cmd.aggregatorId || '') !== d.aggregatorId) {
+      throw new DomainError('DISPUTE_OWNER_MISMATCH', '只有提起该异议的代理商可以补充材料', { owner: d.aggregatorId });
+    }
+    const expected = d.materials.length + 1;
+    if (cmd.materialSeq != null && Number(cmd.materialSeq) !== expected) {
+      throw new DomainError('MATERIAL_SEQ_CONFLICT', `补充材料只能顺序追加：期望序号 ${expected}`, {
+        expected, provided: Number(cmd.materialSeq),
+      });
+    }
+    const note = String(cmd.note || '').trim();
+    if (!note) throw new DomainError('BAD_REQUEST', '材料说明 note 必填');
+
+    const payload = {
+      disputeId: d.disputeId,
+      requestId: cmd.requestId,
+      bodyHash: gate.bodyHash,
+      aggregatorId: d.aggregatorId,
+      eventId: d.eventId,
+      reportId: d.reportId,
+      materialSeq: expected,
+      material: { kind: String(cmd.kind || 'EVIDENCE'), note, ref: cmd.ref ? String(cmd.ref) : null },
+      at: now,
+    };
+    this.store.append('DISPUTE_SUPPLEMENTED', payload, now);
+    this.apply(this.store.all().at(-1));
+    return { dispute: this.disputeView(d.disputeId), material: this.s.disputes.get(d.disputeId).materials.at(-1), idempotent: false };
+  }
+
+  // 审核：一经通过（UPHELD）或驳回（REJECTED）即为终态，不可再次裁定；
+  // 审核只形成结论记录，绝不修改被质疑的原始裁定内容。
+  resolveDispute(cmd, now) {
+    const gate = this.#requestGate(cmd);
+    if (gate.seen) {
+      return { dispute: this.disputeView(gate.seen.disputeId), idempotent: true };
+    }
+    const d = this.#requireDispute(cmd.disputeId);
+    if (d.status !== 'PENDING') {
+      throw new DomainError('DISPUTE_TERMINAL', '审核一经通过或驳回便不可再次裁定', {
+        status: d.status, resolution: d.resolution,
+      });
+    }
+    const outcome = String(cmd.outcome || '');
+    if (!DISPUTE_OUTCOMES.includes(outcome)) {
+      throw new DomainError('BAD_REQUEST', `outcome 必须是 ${DISPUTE_OUTCOMES.join('（通过）/ ')}（驳回）`);
+    }
+    const payload = {
+      disputeId: d.disputeId,
+      requestId: cmd.requestId,
+      bodyHash: gate.bodyHash,
+      aggregatorId: d.aggregatorId,
+      eventId: d.eventId,
+      reportId: d.reportId,
+      outcome,
+      comment: cmd.comment ? String(cmd.comment) : null,
+      resolvedBy: cmd.resolvedBy ? String(cmd.resolvedBy) : '运营方',
+      resolvedAt: now,
+    };
+    this.store.append('DISPUTE_RESOLVED', payload, now);
+    this.apply(this.store.all().at(-1));
+    return { dispute: this.disputeView(d.disputeId), idempotent: false };
+  }
+
+  disputeView(id) {
+    const d = this.s.disputes.get(id);
+    if (!d) return null;
+    return {
+      disputeId: d.disputeId,
+      aggregatorId: d.aggregatorId,
+      eventId: d.eventId,
+      reportId: d.reportId,
+      reportVersion: d.reportVersion,
+      reportHash: d.reportHash,
+      reason: d.reason,
+      status: d.status,
+      filedAt: d.filedAt,
+      filedAtIso: iso(d.filedAt),
+      deadline: d.deadline,
+      deadlineIso: iso(d.deadline),
+      materials: d.materials.map((m) => ({ ...m })),
+      resolution: d.resolution ? { ...d.resolution } : null,
+      history: d.history.map((h) => ({ ...h })),
+    };
+  }
+
+  listDisputes() {
+    return [...this.s.disputes.values()].map((d) => this.disputeView(d.disputeId));
+  }
+
   // ---------- 仿真推进 ----------
 
   tick(minutes, prevNow) {
@@ -960,6 +1197,7 @@ export class Kernel {
         };
       }),
       events: [...this.s.events.values()].map((e) => this.eventView(e.id)),
+      disputes: this.listDisputes(),
       chain: this.store.verify(),
     };
   }

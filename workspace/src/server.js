@@ -180,6 +180,60 @@ const server = createServer(async (req, res) => {
       return send(res, 200, kernel.dispatch({ type: 'RESET' }));
     }
 
+    // ---- 履约异议处置 ----
+    if (path === '/api/disputes' && req.method === 'POST') {
+      const out = kernel.dispatch({
+        type: 'FILE_DISPUTE',
+        requestId: body.requestId,
+        aggregatorId: body.aggregatorId,
+        reportId: body.reportId,
+        reportHash: body.reportHash,
+        reason: body.reason,
+      });
+      return send(res, out.idempotent ? 200 : 201, out);
+    }
+    if (path === '/api/disputes' && req.method === 'GET') {
+      const status = url.searchParams.get('status');
+      const aggregatorId = url.searchParams.get('aggregatorId');
+      let list = kernel.listDisputes();
+      if (status) list = list.filter((d) => d.status === status);
+      if (aggregatorId) list = list.filter((d) => d.aggregatorId === aggregatorId);
+      return send(res, 200, { count: list.length, disputes: list });
+    }
+    const disputeGet = path.match(/^\/api\/disputes\/([^/]+)$/);
+    if (disputeGet && req.method === 'GET') {
+      const view = kernel.disputeView(decodeURIComponent(disputeGet[1]));
+      if (!view) return send(res, 404, { error: '异议不存在', code: 'DISPUTE_NOT_FOUND' });
+      return send(res, 200, view);
+    }
+    const supplementMatch = path.match(/^\/api\/disputes\/([^/]+)\/supplements$/);
+    if (supplementMatch && req.method === 'POST') {
+      const cmd = {
+        type: 'SUPPLEMENT_DISPUTE',
+        disputeId: decodeURIComponent(supplementMatch[1]),
+        requestId: body.requestId,
+        aggregatorId: body.aggregatorId,
+        kind: body.kind,
+        note: body.note,
+        ref: body.ref,
+      };
+      if (body.materialSeq != null) cmd.materialSeq = Number(body.materialSeq);
+      const out = kernel.dispatch(cmd);
+      return send(res, out.idempotent ? 200 : 201, out);
+    }
+    const resolutionMatch = path.match(/^\/api\/disputes\/([^/]+)\/resolution$/);
+    if (resolutionMatch && req.method === 'POST') {
+      const out = kernel.dispatch({
+        type: 'RESOLVE_DISPUTE',
+        disputeId: decodeURIComponent(resolutionMatch[1]),
+        requestId: body.requestId,
+        outcome: body.outcome,
+        comment: body.comment,
+        resolvedBy: body.resolvedBy,
+      });
+      return send(res, 200, out);
+    }
+
     // 报告详情 / 校验
     const reportMatch = path.match(/^\/api\/reports\/([^/]+)\/versions\/(\d+)$/);
     if (reportMatch && req.method === 'GET') {
@@ -219,6 +273,9 @@ const server = createServer(async (req, res) => {
       DEVICE_BUSY: 409, DEVICE_ALREADY_CLAIMED: 409, METER_MISMATCH: 409,
       EVENT_TERMINAL: 409, EVENT_RECALLED: 409, NOT_CLAIMED: 409,
       PHASE_CONFLICT: 409, STALE_SEQ: 409, DAY_PRESENT: 409,
+      REQUEST_ID_CONFLICT: 409, DISPUTE_PENDING_EXISTS: 409, DISPUTE_DEADLINE_PASSED: 409,
+      DISPUTE_TERMINAL: 409, DISPUTE_OWNER_MISMATCH: 409, MATERIAL_SEQ_CONFLICT: 409,
+      REPORT_HASH_MISMATCH: 409, REPORT_NOT_FOUND: 404, DISPUTE_NOT_FOUND: 404,
       LOG_QUARANTINED: 503,
       UNKNOWN_COMMAND: 400,
     };

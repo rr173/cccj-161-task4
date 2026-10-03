@@ -123,6 +123,48 @@ export class OrchestratorTailer {
         },
       };
     }
+    // 履约异议：受理 / 补充材料 / 审核结论 各自生成独立通知（sourceRef=orch:seq 幂等去重）
+    if (rec.type === 'DISPUTE_FILED') {
+      return {
+        type: 'dr.dispute.accepted',
+        eventId: p.eventId,
+        detail: {
+          orchestratorSeq: rec.seq,
+          disputeId: p.disputeId,
+          aggregatorId: p.aggregatorId,
+          reportId: p.reportId,
+          reportVersion: p.reportVersion,
+          reportHash: p.reportHash,
+          deadline: p.deadline,
+        },
+      };
+    }
+    if (rec.type === 'DISPUTE_SUPPLEMENTED') {
+      return {
+        type: 'dr.dispute.supplemented',
+        eventId: p.eventId,
+        detail: {
+          orchestratorSeq: rec.seq,
+          disputeId: p.disputeId,
+          aggregatorId: p.aggregatorId,
+          reportId: p.reportId,
+          materialSeq: p.materialSeq,
+        },
+      };
+    }
+    if (rec.type === 'DISPUTE_RESOLVED') {
+      return {
+        type: 'dr.dispute.resolved',
+        eventId: p.eventId,
+        detail: {
+          orchestratorSeq: rec.seq,
+          disputeId: p.disputeId,
+          aggregatorId: p.aggregatorId,
+          reportId: p.reportId,
+          outcome: p.outcome,
+        },
+      };
+    }
     return null;
   }
 }
