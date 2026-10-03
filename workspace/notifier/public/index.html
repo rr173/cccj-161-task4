@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>聚合商通知投递台 · 需求响应</title>
+<style>
+  :root {
+    --bg: #0f141b; --panel: #171e28; --panel2: #1d2632; --line: #2a3543;
+    --text: #e6edf3; --muted: #8b9aa8; --accent: #4ea1ff; --accent2: #2d4a6e;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --dead: #f85149; --ack: #3fb950;
+    --pend: #8b9aa8; --inf: #4ea1ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 14px; flex-wrap: wrap; background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 10px; padding: 1px 9px; }
+  .meta { margin-left: auto; display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--muted); }
+  button { background: var(--accent2); color: var(--text); border: 1px solid #3d5f87; border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #38597e; }
+  button.ghost { background: transparent; border-color: var(--line); color: var(--muted); }
+  button.danger { background: #5e2a2a; border-color: #8a3a3a; }
+  button.small { padding: 2px 8px; font-size: 11px; }
+  input, select, textarea { background: #0c1117; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; width: 100%; }
+  label { display: block; font-size: 11px; color: var(--muted); margin: 8px 0 3px; }
+  .layout { display: grid; grid-template-columns: 380px 1fr; gap: 14px; padding: 14px 20px; align-items: start; }
+  .col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .card h2 { font-size: 13px; margin: 0 0 4px; font-weight: 600; }
+  .hint { color: var(--muted); font-size: 11px; margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .kv { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 2px 0; }
+  .kv .k { color: var(--muted); }
+  code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; }
+  .mono.small { font-size: 10.5px; word-break: break-all; color: #b8c6d4; }
+  .badge { display: inline-block; border-radius: 9px; padding: 0 8px; font-size: 10.5px; font-weight: 600; }
+  .b-ACKED { background: rgba(63,185,80,.15); color: var(--ack); }
+  .b-PENDING { background: rgba(139,154,168,.15); color: var(--pend); }
+  .b-INFLIGHT { background: rgba(78,161,255,.15); color: var(--inf); }
+  .b-DEAD { background: rgba(248,81,73,.18); color: var(--dead); }
+  .b-ACTIVE { background: rgba(63,185,80,.15); color: var(--ok); }
+  .b-PENDING_SUB { background: rgba(210,153,34,.15); color: var(--warn); }
+  .b-REJECTED { background: rgba(248,81,73,.18); color: var(--err); }
+  .sub { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 10px; background: var(--panel2); overflow: hidden; }
+  .sub-head { padding: 10px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; cursor: pointer; }
+  .sub-head .name { font-weight: 600; }
+  .sub-head .cursor { margin-left: auto; color: var(--muted); font-size: 11px; }
+  .sub-body { padding: 0 12px 12px; border-top: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); font-size: 11.5px; vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  .qitem { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px dashed var(--line); font-size: 11.5px; }
+  .qitem .seq { width: 30px; color: var(--muted); }
+  .qitem .grow { flex: 1; min-width: 0; }
+  .qitem .err { color: var(--err); font-size: 10.5px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { background: var(--accent2); border-radius: 8px; padding: 0 8px; font-size: 10.5px; color: #bcd9f5; }
+  .banner { background: #4a3510; border: 1px solid #7a5a1e; color: #f0d9a0; border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-size: 12px; display: none; }
+  .banner.show { display: block; }
+  pre.evidence { background: #0c1117; border: 1px solid var(--line); border-radius: 8px; padding: 10px; max-height: 360px; overflow: auto; font-size: 10.5px; white-space: pre-wrap; word-break: break-all; }
+  .toast { position: fixed; right: 20px; bottom: 20px; background: #233; border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; max-width: 420px; box-shadow: 0 8px 24px rgba(0,0,0,.5); font-size: 12px; display: none; z-index: 99; }
+  .toast.show { display: block; }
+  .toast.ok { border-color: #2f6b39; }
+  .toast.err { border-color: #7a3030; }
+  .pillrow { display:flex; gap:6px; flex-wrap: wrap; margin-top: 6px; }
+  .stat { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font-size: 12px; }
+  .stat b { font-size: 16px; }
+  .trace-line { padding: 1px 0; }
+  .ok-text { color: var(--ok); } .err-text { color: var(--err); } .warn-text { color: var(--warn); } .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>聚合商通知投递台</h1>
+  <span class="tag">不可变信封 · Ed25519 签名</span>
+  <span class="tag">每订阅方持久待发队列</span>
+  <span class="tag">稳定幂等键</span>
+  <div class="meta">
+    <span id="chainState"></span>
+    <button class="ghost small" id="refreshBtn">立即刷新</button>
+    <label class="muted" style="margin:0"><input type="checkbox" id="autoRefresh" checked style="width:auto"> 自动</label>
+  </div>
+</header>
+
+<div class="layout">
+  <!-- ============ 左列：操作台 ============ -->
+  <div class="col">
+    <div class="card">
+      <h2>1 · 新增订阅方（订阅校验）</h2>
+      <p class="hint">回调地址可用内置模拟端 <span class="mono">/mock/subscribers/&lt;id&gt;/callback</span>。创建即发起 WebSub 风格校验，secret 仅显示一次。</p>
+      <label>订阅方 ID</label><input id="subId" placeholder="sub-alpha">
+      <label>显示名称</label><input id="subName" placeholder="聚合商甲">
+      <label>回调 URL（留空使用内置模拟端）</label><input id="subCb" placeholder="http://127.0.0.1:8091/mock/subscribers/sub-alpha/callback">
+      <label>主题（逗号分隔，* 全量）</label><input id="subTopics" value="*">
+      <div class="pillrow"><button id="addSub">注册并校验</button></div>
+    </div>
+
+    <div class="card">
+      <h2>2 · 生成通知（5 类事件 → 不可变信封）</h2>
+      <p class="hint">发布 / 撤销 / 开始 / 结束 / 报告订正。每个事件一个全局顺序信封，按订阅方分别持久入队。</p>
+      <div class="row">
+        <div><label>类型</label>
+          <select id="evType">
+            <option value="dr.event.published">发布 published</option>
+            <option value="dr.event.cancelled">撤销 cancelled</option>
+            <option value="dr.event.started">开始 started</option>
+            <option value="dr.event.ended">结束 ended</option>
+            <option value="dr.event.report.corrected">报告订正 report.corrected</option>
+          </select>
+        </div>
+        <div><label>事件 ID</label><input id="evId" value="EV-DEMO"></div>
+      </div>
+      <label>sourceRef（稳定去重键，留空自动）</label><input id="evSource" placeholder="例如 manual:EV-DEMO:publish">
+      <label>detail（JSON，可空）</label>
+      <textarea id="evDetail" rows="3" placeholder='{"targetKw":120,"meterId":"MP-1"}'></textarea>
+      <div class="pillrow"><button id="ingest">生成信封并入队</button></div>
+    </div>
+
+    <div class="card">
+      <h2>3 · 故障注入 / 密钥轮换</h2>
+      <p class="hint">先选中右侧订阅方，再注入。模拟投递端暂时失败、确认丢失、重复确认、订阅校验拒绝。</p>
+      <div class="row">
+        <div><label>目标订阅方</label><select id="modeSub"></select></div>
+        <div><label>模式</label>
+          <select id="modeKind">
+            <option value="OK">OK 正常</option>
+            <option value="FAIL_NEXT">FAIL_NEXT 暂时失败</option>
+            <option value="LOSE_ACK">LOSE_ACK 确认丢失</option>
+            <option value="DUPLICATE_ACK">DUPLICATE_ACK 重复确认</option>
+            <option value="REJECT_VALIDATION">REJECT_VALIDATION 拒绝校验</option>
+          </select>
+        </div>
+      </div>
+      <div class="row"><div><label>失败次数（仅 FAIL_NEXT）</label><input id="modeBudget" type="number" value="2" min="1"></div></div>
+      <div class="pillrow">
+        <button id="setMode">注入模式</button>
+        <button class="ghost" id="rotateKey">轮换签名密钥</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 右列：状态/证据 ============ -->
+  <div class="col">
+    <div id="banner" class="banner"></div>
+    <div class="card">
+      <h2>总览</h2>
+      <div id="overview" class="chips" style="margin:6px 0"></div>
+      <div class="kv"><span class="k">活动签名密钥</span><span class="mono" id="activeKey"></span></div>
+      <div class="kv"><span class="k">历史密钥（轮换后旧在途通知仍用旧公钥验签）</span><span id="keyList" class="chips"></span></div>
+      <div class="pillrow">
+        <button class="ghost small" id="verifyChain">校验通知链 + 模拟端台账</button>
+        <button class="ghost small" id="showLog">查看账本记录（JSONL）</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>每订阅方持久待发队列</h2>
+      <p class="hint">严格按 # 顺序投递；游标只在队首确认时推进；DEAD 阻塞本队列后续，可人工重新入队；不同订阅方互不阻塞。</p>
+      <div id="subs"></div>
+    </div>
+    <div class="card">
+      <h2>信封 &amp; 签名证据</h2>
+      <div class="row">
+        <div style="max-width:160px"><label>信封 #</label><input id="verifySeq" type="number" min="1" placeholder="1"></div>
+        <div style="align-self:flex-end"><button id="verifyEnv">独立验签信封</button></div>
+      </div>
+      <pre id="evidence" class="evidence" style="display:none"></pre>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+let state = null;
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    method: opts.method || 'GET',
+    headers: opts.body ? { 'Content-Type': 'application/json' } : {},
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(json.error || ('HTTP ' + res.status)), { body: json, status: res.status });
+  return json;
+}
+
+function toast(msg, ok = true) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (ok ? 'ok' : 'err');
+  clearTimeout(toast._tm);
+  toast._tm = setTimeout(() => t.classList.remove('show'), 5000);
+}
+const short = (s, n = 14) => s ? String(s).slice(0, n) + (String(s).length > n ? '…' : '') : '';
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const TYPE_LABEL = {
+  'dr.event.published': '发布', 'dr.event.cancelled': '撤销', 'dr.event.started': '开始',
+  'dr.event.ended': '结束', 'dr.event.report.corrected': '订正',
+};
+
+async function addSubscriber() {
+  const id = $('subId').value.trim() || ('sub-' + Math.random().toString(16).slice(2, 7));
+  const cb = $('subCb').value.trim() || `/mock/subscribers/${id}/callback`;
+  try {
+    const r = await api('/api/subscribers', {
+      method: 'POST',
+      body: {
+        subscriberId: id,
+        displayName: $('subName').value.trim() || id,
+        callbackUrl: cb.startsWith('http') ? cb : location.origin + cb,
+        topics: $('subTopics').value.split(',').map((s) => s.trim()).filter(Boolean),
+      },
+    });
+    toast(`订阅方 ${id} 已注册：校验${r.validation.accepted ? '通过 ✔（secret 仅显示一次：' + short(r.secret, 10) + '…）' : '被拒 ✘ — ' + r.validation.reason}`, r.validation.accepted);
+    $('subId').value = ''; $('subName').value = ''; $('subCb').value = '';
+    await refresh();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function ingest() {
+  let detail = {};
+  if ($('evDetail').value.trim()) {
+    try { detail = JSON.parse($('evDetail').value); } catch { return toast('detail 不是合法 JSON', false); }
+  }
+  try {
+    const r = await api('/api/events/ingest', {
+      method: 'POST',
+      body: {
+        type: $('evType').value, eventId: $('evId').value.trim() || 'EV-DEMO',
+        sourceRef: $('evSource').value.trim() || undefined, detail,
+      },
+    });
+    toast(r.deduplicated
+      ? `sourceRef 已接入过 → 幂等返回信封 #${r.envelopeSeq}，未重复入队`
+      : `信封 #${r.envelopeSeq} 已生成并对 ${r.enqueued.length} 个订阅方入队（${short(r.envelope.keyId, 16)}…）`);
+    await refresh();
+  } catch (e) { toast(e.message, false); }
+}
+
+async function setMode() {
+  try {
+    const r = await api('/mock/mode', {
+      method: 'POST',
+      body: { subscriberId: $('modeSub').value, mode: $('modeKind').value, budget: Number($('modeBudget').value) },
+    });
+    toast(`模拟端 ${r.subscriberId} 模式 → ${r.mode}${r.budget ? '（预算 ' + r.budget + '）' : ''}`);
+  } catch (e) { toast(e.message, false); }
+}
+
+async function resendAck(sub, seq) {
+  try {
+    const r = await api(`/mock/subscribers/${encodeURIComponent(sub)}/resend-ack/${seq}`, { method: 'POST' });
+    toast(`已补发确认 #${seq}：` + (r.result.ok ? `游标=${r.result.cursor}` : r.result.error || r.result.body?.error || '被拒绝'), r.result.ok);
+    await refresh();
+  } catch (e) { toast(e.message, false); }
+}
+async function requeue(sub, seq) {
+  try {
+    await api(`/api/subscribers/${encodeURIComponent(sub)}/queue/${seq}/requeue`, { method: 'POST', body: { reason: '投递台人工重新入队' } });
+    toast(`死信 #${seq} 已重新入队（attempts 归零，仍在原位置保序投递）`);
+    await refresh();
+  } catch (e) { toast(e.message, false); }
+}
+async function showInbox(sub, btn) {
+  try {
+    const r = await api(`/mock/subscribers/${encodeURIComponent(sub)}/inbox`);
+    const div = document.getElementById(`inbox-${cssId(sub)}`);
+    div.style.display = div.style.display === 'block' ? 'none' : 'block';
+    div.innerHTML = '<div class="muted" style="margin:4px 0">订阅端收信台账（按幂等键去重，重启后仍在）</div>' +
+      (r.inbox.length ? r.inbox.map((m) => `<div class="qitem"><span class="seq">#${m.envelopeSeq}</span><span class="grow mono small">${esc(TYPE_LABEL[m.type] || m.type)} · ${esc(short(m.idempotencyKey, 38))} · 见到投递 ${m.attemptsSeen} 次 · key ${esc(short(m.keyId, 12))}</span></div>`).join('') : '<div class="muted">（空）</div>');
+    btn.textContent = div.style.display === 'block' ? '隐藏台账' : '查看收信台账';
+  } catch (e) { toast(e.message, false); }
+}
+async function verifyEnv() {
+  const seq = Number($('verifySeq').value);
+  if (!seq) return;
+  try {
+    const r = await api(`/api/envelopes/${seq}/verify`);
+    const ev = await api(`/api/envelopes/${seq}`);
+    $('evidence').style.display = 'block';
+    $('evidence').textContent = JSON.stringify({
+      结论: r.immutabilityIntact ? '✔ 不可改性完好（签名有效且在哈希链上）' : '✘ 证据异常',
+      信封: { envelopeSeq: r.envelopeSeq, notificationId: r.notificationId, type: r.type },
+      签名: { keyId: r.keyId, '该密钥是否仍是活动密钥': r.keyActive, '签名验证': r.signatureValid ? '通过' : '失败' },
+      账本锚点: { ledgerSeq: r.ledgerSeq, ledgerHash: r.ledgerHash, chainOk: r.chainOk },
+      canonical: r.canonical,
+      signature: r.signature,
+      完整信封: ev,
+    }, null, 2);
+  } catch (e) { toast(e.message, false); }
+}
+async function evidence(sub, seq) {
+  try {
+    const r = await api(`/api/subscribers/${encodeURIComponent(sub)}/queue/${seq}/evidence`);
+    $('verifySeq').value = seq;
+    $('evidence').style.display = 'block';
+    $('evidence').textContent = JSON.stringify({
+      订阅方: r.subscriber,
+      投递项: r.item,
+      信封: r.envelope,
+      验签: { signatureValid: r.verification.signatureValid, keyActive: r.verification.keyActive, chainOk: r.verification.chainOk },
+      全链路账本轨迹: r.trace.map((t) => `#${t.seq} ${t.ts} ${t.type}`),
+    }, null, 2);
+  } catch (e) { toast(e.message, false); }
+}
+async function verifyChain() {
+  try {
+    const r = await api('/api/chain/verify');
+    toast(`通知链 ${r.notifier.ok ? '完整 ✔（' + r.notifier.length + ' 条）' : '✘ 损坏'}；模拟端台账 ${r.mock.ok ? '完整 ✔' : '✘'}`, r.notifier.ok && r.mock.ok);
+  } catch (e) { toast(e.message, false); }
+}
+async function showLog() {
+  const r = await api('/api/log?limit=120');
+  $('evidence').style.display = 'block';
+  $('evidence').textContent = r.records.map((x) => JSON.stringify({ seq: x.seq, ts: x.ts, type: x.type, payload: x.payload })).join('\n');
+}
+
+function cssId(s) { return s.replace(/[^a-zA-Z0-9_-]/g, '_'); }
+
+function render() {
+  if (!state) return;
+  const banner = $('banner');
+  if (!state.writable) {
+    banner.classList.add('show');
+    banner.textContent = '⛔ 通知账本已只读隔离（LOG_QUARANTINED）：' + (state.recovery?.reason || '');
+  } else if (state.recovery?.kind === 'torn-tail-recovered') {
+    banner.classList.add('show');
+    banner.textContent = '⚠ 断电残尾已归档并从最后完好记录续链：' + state.recovery.archivePath;
+  } else banner.classList.remove('show');
+
+  $('chainState').textContent = `链 ${state.chain.ok ? 'OK' : '损坏'} · ${state.chain.length} 条 · 信封 ${state.envelopeSeq}`;
+  const counts = {};
+  for (const s of state.subscribers) for (const q of s.queue) counts[q.status] = (counts[q.status] || 0) + 1;
+  $('overview').innerHTML = [
+    `<span class="stat">订阅方 <b>${state.subscribers.length}</b></span>`,
+    `<span class="stat">待发 <b>${counts.PENDING || 0}</b></span>`,
+    `<span class="stat">在途 <b>${counts.INFLIGHT || 0}</b></span>`,
+    `<span class="stat">已确认 <b>${counts.ACKED || 0}</b></span>`,
+    `<span class="stat">死信 <b class="${state.deadLetterCount ? 'err-text' : ''}">${state.deadLetterCount}</b></span>`,
+  ].join('');
+  $('activeKey').textContent = short(state.activeKeyId, 26);
+  $('keyList').innerHTML = state.keys.map((k) => `<span class="chip" title="${esc(k.publicKeyPem)}">${esc(short(k.keyId, 16))}${k.active ? ' ★活动' : '（旧）'}</span>`).join('');
+
+  const sel = $('modeSub');
+  const cur = sel.value;
+  sel.innerHTML = state.subscribers.map((s) => `<option value="${esc(s.subscriberId)}">${esc(s.subscriberId)}</option>`).join('');
+  if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+
+  $('subs').innerHTML = state.subscribers.length ? state.subscribers.map(renderSub).join('')
+    : '<div class="muted">还没有订阅方。用左上方表单注册一个（默认使用内置模拟端）。</div>';
+}
+
+function renderSub(s) {
+  const subClass = s.status === 'ACTIVE' ? 'b-ACTIVE' : s.status === 'REJECTED' ? 'b-REJECTED' : 'b-PENDING_SUB';
+  const dead = s.queue.filter((q) => q.status === 'DEAD');
+  const q = s.queue.map((item) => {
+    const acts = [];
+    if (item.status === 'DEAD') acts.push(`<button class="small danger" onclick="requeue('${esc(s.subscriberId)}',${item.envelopeSeq})">人工重新入队</button>`);
+    acts.push(`<button class="small ghost" onclick="evidence('${esc(s.subscriberId)}',${item.envelopeSeq})">证据</button>`);
+    if (item.sentAt && item.status !== 'ACKED') acts.push(`<button class="small ghost" onclick="resendAck('${esc(s.subscriberId)}',${item.envelopeSeq})">补发确认</button>`);
+    return `<div class="qitem">
+      <span class="seq mono">#${item.envelopeSeq}</span>
+      <span class="badge b-${item.status}">${item.status}</span>
+      <span class="grow">${esc(TYPE_LABEL[item.type] || item.type)} · 尝试 ${item.attempts}
+        ${item.lastError ? `<div class="err">${esc(item.lastError)}</div>` : ''}
+        <div class="mono small muted">${esc(short(item.idempotencyKey, 46))}</div>
+      </span>
+      ${acts.join(' ')}
+    </div>`;
+  }).join('');
+  return `<div class="sub">
+    <div class="sub-head">
+      <span class="name">${esc(s.displayName)}</span>
+      <span class="mono muted">${esc(s.subscriberId)}</span>
+      <span class="badge ${subClass}">${s.status}</span>
+      <span class="cursor">cursor=${s.cursor} · 队列 ${s.queue.length}${dead.length ? ` · <span class="err-text">死信 ${dead.length}</span>` : ''}</span>
+    </div>
+    <div class="sub-body">
+      <div class="muted mono small" style="margin-top:6px">${esc(s.callbackUrl)}</div>
+      <div class="chips" style="margin-top:4px">${s.topics.map((t) => `<span class="chip">${esc(t)}</span>`).join('')}</div>
+      ${q || '<div class="muted" style="margin-top:6px">队列空（无匹配主题的事件，或订阅尚未生效）</div>'}
+      <div class="pillrow" style="margin-top:8px">
+        <button class="small ghost" onclick="showInbox('${esc(s.subscriberId)}',this)">查看收信台账</button>
+      </div>
+      <div id="inbox-${cssId(s.subscriberId)}" style="display:none"></div>
+    </div>
+  </div>`;
+}
+
+async function refresh() {
+  try { state = await api('/api/state'); render(); } catch (e) { /* 刷新失败静默 */ }
+}
+
+$('addSub').onclick = addSubscriber;
+$('ingest').onclick = ingest;
+$('setMode').onclick = setMode;
+$('rotateKey').onclick = async () => { try { const r = await api('/api/keys/rotate', { method: 'POST', body: { reason: '投递台轮换' } }); toast(`新活动密钥 ${short(r.keyId, 18)}…，旧信封仍可用旧公钥验证`); await refresh(); } catch (e) { toast(e.message, false); } };
+$('verifyEnv').onclick = verifyEnv;
+$('verifyChain').onclick = verifyChain;
+$('showLog').onclick = showLog;
+$('refreshBtn').onclick = refresh;
+setInterval(() => { if ($('autoRefresh').checked) refresh(); }, 1200);
+refresh();
+</script>
+</body>
+</html>

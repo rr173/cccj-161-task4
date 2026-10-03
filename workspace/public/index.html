@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>需求响应事件编排 · 运营台</title>
+<style>
+  :root {
+    --bg:#0e1420; --panel:#161f2e; --panel2:#1c2738; --line:#28354a;
+    --txt:#e6ecf5; --muted:#8fa0b8; --accent:#4f9cff; --ok:#34c78a;
+    --warn:#f0b429; --bad:#f06a6a; --violet:#b58cff; --cyan:#4fd6e0;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); }
+  header { display:flex; align-items:center; gap:16px; padding:14px 22px; background:linear-gradient(90deg,#12203a,#0e1420); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
+  header h1 { font-size:17px; margin:0; }
+  header .clock { font-variant-numeric:tabular-nums; color:var(--cyan); font-weight:600; }
+  .spacer { flex:1; }
+  .wrap { display:grid; grid-template-columns:300px 1fr 380px; gap:14px; padding:14px 22px; align-items:start; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
+  .panel h3 { font-size:13px; margin:14px 0 6px; color:var(--muted); }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 3px; }
+  select, input, button, textarea {
+    font:inherit; width:100%; background:var(--panel2); color:var(--txt);
+    border:1px solid var(--line); border-radius:7px; padding:7px 9px;
+  }
+  button { cursor:pointer; width:auto; padding:7px 12px; font-weight:600; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06101f; }
+  button.good { background:var(--ok); border-color:var(--ok); color:#06140d; }
+  button.warn { background:var(--warn); border-color:var(--warn); color:#1c1400; }
+  button.bad { background:var(--bad); border-color:var(--bad); color:#200606; }
+  button.ghost { background:transparent; color:var(--muted); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .card { background:var(--panel2); border:1px solid var(--line); border-radius:9px; padding:11px; margin-bottom:10px; }
+  .card.active { border-color:var(--ok); box-shadow:0 0 0 1px rgba(52,199,138,.25); }
+  .card.recalled { border-color:var(--bad); opacity:.75; }
+  .card.closed { border-color:var(--line); }
+  .card.scheduled { border-color:var(--accent); }
+  .tag { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11px; font-weight:700; }
+  .tag.SCHEDULED { background:#13315c; color:#8fc2ff; }
+  .tag.ACTIVE { background:#0f3a2a; color:#5fe3ac; }
+  .tag.CLOSED { background:#26303f; color:#9fb2c8; }
+  .tag.RECALLED { background:#3f1d1d; color:#ff9d9d; }
+  .tag.ACCEPTED { background:#13315c; color:#8fc2ff; }
+  .tag.EXECUTING { background:#0f3a2a; color:#5fe3ac; }
+  .tag.RECOVERED,.tag.PERFORMED,.tag.MET { background:#0f3a2a; color:#5fe3ac; }
+  .tag.DECLINED,.tag.OPT_OUT,.tag.NO_PARTICIPATION { background:#3f1d1d; color:#ff9d9d; }
+  .tag.PARTIAL,.tag.UNDERPERFORMED,.tag.INCONCLUSIVE { background:#3d2f10; color:#f5c451; }
+  .tag.MISSED,.tag.FAILED { background:#3f1d1d; color:#ff9d9d; }
+  .tag.RECALLED { background:#3f1d1d; color:#ff9d9d; }
+  .muted { color:var(--muted); font-size:12px; }
+  .mono { font-variant-numeric:tabular-nums; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { text-align:left; padding:6px 7px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:11.5px; }
+  tr.selected { background:#132742; }
+  .btns button { padding:4px 8px; font-size:12px; margin:1px 2px 1px 0; }
+  .toast-wrap { position:fixed; right:18px; bottom:18px; display:flex; flex-direction:column; gap:8px; z-index:50; }
+  .toast { background:#202b3d; border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:8px; padding:9px 13px; max-width:380px; box-shadow:0 10px 30px rgba(0,0,0,.4); animation:in .2s ease; }
+  .toast.err { border-left-color:var(--bad); }
+  .toast.ok { border-left-color:var(--ok); }
+  @keyframes in { from{transform:translateY(8px);opacity:0} to{transform:none;opacity:1} }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:12.5px; }
+  .kv dt { color:var(--muted); } .kv dd { margin:0; text-align:right; }
+  .bar { height:8px; background:#0c1320; border-radius:99px; overflow:hidden; margin-top:3px; }
+  .bar > i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--cyan)); }
+  details { margin-top:8px; }
+  summary { cursor:pointer; color:var(--muted); font-size:12px; }
+  pre.log { max-height:260px; overflow:auto; background:#0a101b; border:1px solid var(--line); border-radius:8px; padding:9px; font-size:11px; color:#a9c0dd; white-space:pre-wrap; }
+  .offline { color:var(--bad); font-weight:700; }
+  .pill { font-size:11px; border:1px solid var(--line); border-radius:99px; padding:0 7px; color:var(--muted); }
+  .report { border-left:3px solid var(--violet); padding-left:10px; margin:8px 0; }
+  .report.v1 { border-left-color:var(--cyan); }
+  .chain-ok { color:var(--ok); } .chain-bad { color:var(--bad); }
+  .quarantine-banner { margin:0; padding:10px 22px; background:#3f1d1d; border-bottom:1px solid var(--bad); color:#ffc9c9; font-size:13px; }
+  .quarantine-banner b { color:#ff9d9d; }
+  .quarantine-banner .mono { color:#ffd9d9; }
+  .recovered-banner { margin:0; padding:8px 22px; background:#3d2f10; border-bottom:1px solid var(--warn); color:#f5d98a; font-size:12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ 需求响应事件编排 · 运营台</h1>
+  <span class="clock" id="clock">--</span>
+  <span id="chainBadge"></span>
+  <div class="spacer"></div>
+  <div class="row">
+    <button class="ghost" onclick="tick(15)">+15 分钟</button>
+    <button class="ghost" onclick="tick(60)">+1 小时</button>
+    <button class="ghost" onclick="tick(240)">+4 小时</button>
+    <button class="ghost" onclick="tickToClose()">跳到选中事件结束</button>
+    <button class="warn" onclick="resetAll()">重置演示数据</button>
+  </div>
+</header>
+<div id="recoveryBanner" hidden></div>
+
+<div class="wrap">
+  <!-- 左：发布事件 -->
+  <div>
+    <div class="panel">
+      <h2>① 运营方发布指令</h2>
+      <label>计量点</label>
+      <select id="evMeter"></select>
+      <label>基线算法</label>
+      <select id="evAlg">
+        <option value="MID_8_OF_10">近10日取居中8日（MID_8_OF_10）</option>
+        <option value="LAST_10_AVG">近10日均值（LAST_10_AVG）</option>
+        <option value="LAST_5_AVG">近5日均值（LAST_5_AVG）</option>
+      </select>
+      <div class="grid2">
+        <div><label>目标削减 (kW)</label><input id="evTarget" type="number" value="40" min="1"></div>
+        <div><label>开始于（分钟后）</label><input id="evIn" type="number" value="30" min="1" step="15"></div>
+      </div>
+      <label>时窗长度（15分钟区间数）</label>
+      <input id="evCount" type="number" value="16" min="1" max="96">
+      <div style="margin-top:10px"><button class="primary" onclick="publishEvent()">发布事件（基线将在开始时冻结）</button></div>
+    </div>
+
+    <div class="panel" style="margin-top:14px">
+      <h2>计量点 · 通信</h2>
+      <div id="meters"></div>
+    </div>
+
+    <div class="panel" style="margin-top:14px">
+      <h2>迟到电表数据（订正版）</h2>
+      <div class="muted" style="margin-bottom:6px">MP-1 的 D-4 历史日缺失；事件结束后送达只能产生 v2，v1 原始裁决不变。</div>
+      <button class="ghost" onclick="lateHistory()">补送 MP-1 的 D-4 历史读数</button>
+      <div style="height:8px"></div>
+      <button class="ghost" onclick="backfillSelected()">补传选中事件窗口内缺失的实际读数</button>
+    </div>
+
+    <div class="panel" style="margin-top:14px">
+      <h2>哈希链校验</h2>
+      <div id="chainInfo" class="mono muted"></div>
+      <div style="margin-top:8px"><button class="ghost" onclick="verifyChain()">验证事件链 + 报告指纹</button></div>
+      <pre class="log" id="verifyOut" hidden></pre>
+    </div>
+  </div>
+
+  <!-- 中：事件 + 设备 -->
+  <div>
+    <div class="panel">
+      <h2>② 事件与设备归属</h2>
+      <div id="events"></div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>设备执行台（声明 / 回执 / 水位）</h2>
+      <table>
+        <thead><tr><th>设备</th><th>计量点</th><th>聚合商声明</th><th>状态 / 水位</th><th>操作</th></tr></thead>
+        <tbody id="devices"></tbody>
+      </table>
+      <div class="muted" style="margin-top:6px">
+        并发演示：同一台设备同时归属两个有效事件会被拒绝；撤销与执行并发按到达顺序裁决。
+      </div>
+    </div>
+  </div>
+
+  <!-- 右：详情 + 报告 -->
+  <div>
+    <div class="panel">
+      <h2>事件详情</h2>
+      <div id="detail" class="muted">在中间选择一个事件。</div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>削减报告（可验证）</h2>
+      <div id="reports" class="muted">事件结束后生成 v1 原始裁决；迟到数据产生 v2+ 订正版。</div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>近期裁决日志</h2>
+      <pre class="log" id="miniLog">（点击“校验/日志”加载）</pre>
+      <button class="ghost" onclick="loadLog()">刷新裁决日志</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>

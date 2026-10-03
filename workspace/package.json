@@ -1,0 +1,19 @@
+{
+  "name": "dr-orchestrator",
+  "version": "1.0.0",
+  "description": "电力需求响应事件编排服务（零依赖，事件溯源 + 哈希链）",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "notifier": "node notifier/server.js",
+    "demo:notifier": "node notifier/demo.mjs",
+    "test": "node --test test/",
+    "test:e2e": "node scripts/e2e.mjs",
+    "test:notifier": "node notifier/e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
